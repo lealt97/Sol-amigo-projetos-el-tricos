@@ -1,0 +1,6 @@
+{
+  "name": "Planta Baixa CAD com Escala",
+  "description": "Editor profissional de Planta Baixa CAD com escala métrica configurável, desenho de paredes com espessura real, cotas, portas, janelas e simbologia NBR 5444.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
