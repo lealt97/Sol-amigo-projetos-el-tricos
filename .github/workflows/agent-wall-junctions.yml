@@ -30,6 +30,26 @@ jobs:
       - name: Apply wall junction refactor
         run: python3 scripts/refactor-wall-junctions.py
 
+      - name: Normalize generated wall JSX
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('src/components/FloorPlanEditor.tsx')
+          text = path.read_text()
+          duplicate = """              </g>
+
+              </g>
+
+              {/* LAYER 4: Interactive Handlers, Selection Overlays, Labels & Cotas */}"""
+          fixed = """              </g>
+
+              {/* LAYER 4: Interactive Handlers, Selection Overlays, Labels & Cotas */}"""
+          if duplicate not in text:
+              raise SystemExit('Expected duplicate generated wall layer closing tag not found')
+          path.write_text(text.replace(duplicate, fixed, 1))
+          print('Generated JSX normalized.')
+          PY
+
       - name: Install dependencies
         run: npm install
 
