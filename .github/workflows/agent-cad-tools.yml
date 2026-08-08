@@ -1,0 +1,52 @@
+name: Agent CAD tools refactor
+
+on:
+  push:
+    branches:
+      - agent/cad-tool-interactions
+
+permissions:
+  contents: write
+
+concurrency:
+  group: agent-cad-tool-interactions
+  cancel-in-progress: true
+
+jobs:
+  refactor-and-validate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v6
+        with:
+          ref: agent/cad-tool-interactions
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Apply CAD tool interaction refactor
+        run: python .agent/refactor_tools.py
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: TypeScript validation
+        run: npm run lint
+
+      - name: Production build
+        run: npm run build
+
+      - name: Commit validated changes
+        shell: bash
+        run: |
+          rm -f .github/workflows/agent-cad-tools.yml
+          rm -rf .agent
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/components/FloorPlanEditor.tsx .github/workflows/agent-cad-tools.yml .agent
+          git commit -m "refactor: stabilize CAD tool interactions"
+          git push origin HEAD:agent/cad-tool-interactions
