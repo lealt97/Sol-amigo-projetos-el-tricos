@@ -2475,7 +2475,7 @@ function distToSegment(
                 patternTransform="rotate(45 0 0)"
                 patternUnits="userSpaceOnUse"
               >
-                <line x1="0" y1="0" x2="0" y2="8" stroke="#A1A1AA" strokeWidth="1" />
+                <line x1="0" y1="0" x2="0" y2="8" stroke="#64748B" strokeWidth="1.2" />
               </pattern>
 
               {/* Seamless Wall Junction Mask (erases strokes passing through intersecting wall cavities) */}
@@ -2556,7 +2556,7 @@ function distToSegment(
               {/* LAYER 1: Unified Wall Core Fills & Masonry Hatching (Merged Cavities) */}
               <g id="unified-wall-cores">
                 {/* Solid Core Fill */}
-                <g fill="#E4E4E7">
+                <g fill="#CBD5E1">
                   {roomsWithGeometry.map((room) => {
                     const rx = room.x! * scalePxPerMeter;
                     const ry = room.y! * scalePxPerMeter;
@@ -2594,7 +2594,7 @@ function distToSegment(
                 </g>
 
                 {/* Masonry Hatching Pattern */}
-                <g fill="url(#wallMasonryPattern)" opacity="0.4">
+                <g fill="url(#wallMasonryPattern)" opacity="0.65">
                   {roomsWithGeometry.map((room) => {
                     const rx = room.x! * scalePxPerMeter;
                     const ry = room.y! * scalePxPerMeter;
@@ -2653,7 +2653,7 @@ function distToSegment(
                       width={innerW}
                       height={innerH}
                       fill={room.color}
-                      fillOpacity="0.35"
+                      fillOpacity="0.22"
                     />
                   );
                 })}
