@@ -1911,6 +1911,55 @@ function distToSegment(
     }
   };
 
+  const isWallEndpointConnected = useCallback(
+    (wall: FloorPlanWall, point: { x: number; y: number }) => {
+      const tolerance = Math.max(0.04, gridSnapMeters * 0.25);
+
+      const distanceToSegment = (
+        p: { x: number; y: number },
+        a: { x: number; y: number },
+        b: { x: number; y: number }
+      ) => {
+        const vx = b.x - a.x;
+        const vy = b.y - a.y;
+        const lengthSq = vx * vx + vy * vy;
+        if (lengthSq <= 1e-9) return Math.hypot(p.x - a.x, p.y - a.y);
+        const t = Math.max(0, Math.min(1, ((p.x - a.x) * vx + (p.y - a.y) * vy) / lengthSq));
+        const px = a.x + vx * t;
+        const py = a.y + vy * t;
+        return Math.hypot(p.x - px, p.y - py);
+      };
+
+      const touchesCustomWall = floorPlanWalls.some((other) => {
+        if (other.id === wall.id) return false;
+        return (
+          distanceToSegment(
+            point,
+            { x: other.x1Meters, y: other.y1Meters },
+            { x: other.x2Meters, y: other.y2Meters }
+          ) <= tolerance
+        );
+      });
+      if (touchesCustomWall) return true;
+
+      return roomsWithGeometry.some((room) => {
+        const left = room.x ?? 0;
+        const top = room.y ?? 0;
+        const right = left + (room.widthMeters ?? 0);
+        const bottom = top + (room.heightMeters ?? 0);
+
+        const withinX = point.x >= left - tolerance && point.x <= right + tolerance;
+        const withinY = point.y >= top - tolerance && point.y <= bottom + tolerance;
+
+        return (
+          (withinX && (Math.abs(point.y - top) <= tolerance || Math.abs(point.y - bottom) <= tolerance)) ||
+          (withinY && (Math.abs(point.x - left) <= tolerance || Math.abs(point.x - right) <= tolerance))
+        );
+      });
+    },
+    [floorPlanWalls, roomsWithGeometry, gridSnapMeters]
+  );
+
   // Render Conduit Lines
   const renderConduitLine = (c: FloorPlanConduit) => {
     const fromSym = floorPlanSymbols.find((s) => s.id === c.fromSymbolId);
@@ -2477,50 +2526,6 @@ function distToSegment(
               >
                 <line x1="0" y1="0" x2="0" y2="8" stroke="#64748B" strokeWidth="1.2" />
               </pattern>
-
-              {/* Seamless Wall Junction Mask (erases strokes passing through intersecting wall cavities) */}
-              <mask id="wall-stroke-mask" maskUnits="userSpaceOnUse">
-                <rect x="-5000" y="-5000" width="10000" height="10000" fill="white" />
-                <g fill="black" stroke="white" strokeWidth="3" strokeLinejoin="miter">
-                  {/* Room Wall Cavities */}
-                  {roomsWithGeometry.map((room) => {
-                    const rx = room.x! * scalePxPerMeter;
-                    const ry = room.y! * scalePxPerMeter;
-                    const rw = room.widthMeters! * scalePxPerMeter;
-                    const rh = room.heightMeters! * scalePxPerMeter;
-                    const wallPx = wallThicknessMeters * scalePxPerMeter;
-                    const outerD = `M ${rx} ${ry} H ${rx + rw} V ${ry + rh} H ${rx} Z`;
-                    const innerD = `M ${rx + wallPx} ${ry + wallPx} V ${ry + rh - wallPx} H ${rx + rw - wallPx} V ${ry + wallPx} Z`;
-                    return <path key={`mask-room-${room.id}`} d={`${outerD} ${innerD}`} fillRule="evenodd" />;
-                  })}
-
-                  {/* Custom Wall Cavities */}
-                  {floorPlanWalls.map((w) => {
-                    const x1 = w.x1Meters * scalePxPerMeter;
-                    const y1 = w.y1Meters * scalePxPerMeter;
-                    const x2 = w.x2Meters * scalePxPerMeter;
-                    const y2 = w.y2Meters * scalePxPerMeter;
-                    const thick = (w.thicknessMeters || wallThicknessMeters) * scalePxPerMeter;
-                    const dx = x2 - x1;
-                    const dy = y2 - y1;
-                    const lengthPx = Math.hypot(dx, dy);
-                    if (lengthPx < 0.1) return null;
-                    const ux = dx / lengthPx;
-                    const uy = dy / lengthPx;
-                    const nx = -uy;
-                    const ny = ux;
-                    const h = thick / 2;
-
-                    // Extends into connected walls by h so mask covers the interior cavity intersection completely
-                    const p1 = { x: x1 - ux * h + nx * h, y: y1 - uy * h + ny * h };
-                    const p2 = { x: x2 + ux * h + nx * h, y: y2 + uy * h + ny * h };
-                    const p3 = { x: x2 + ux * h - nx * h, y: y2 + uy * h - ny * h };
-                    const p4 = { x: x1 - ux * h - nx * h, y: y1 - uy * h - ny * h };
-
-                    return <path key={`mask-wall-${w.id}`} d={`M ${p1.x} ${p1.y} L ${p2.x} ${p2.y} L ${p3.x} ${p3.y} L ${p4.x} ${p4.y} Z`} />;
-                  })}
-                </g>
-              </mask>
             </defs>
 
             {/* Background Grid */}
@@ -2658,10 +2663,9 @@ function distToSegment(
                   );
                 })}
               </g>
-
-              {/* LAYER 3: Masked Outer Wall Outline Strokes (Seamless Open Junctions) */}
-              <g id="masked-wall-strokes" mask="url(#wall-stroke-mask)">
-                {/* Room Border Strokes */}
+              {/* LAYER 3: Continuous Technical Wall Outlines */}
+              <g id="continuous-wall-outlines" fill="none" stroke="#141414" strokeLinejoin="miter">
+                {/* Room walls keep complete outer and inner black contours. */}
                 {roomsWithGeometry.map((room) => {
                   const rx = room.x! * scalePxPerMeter;
                   const ry = room.y! * scalePxPerMeter;
@@ -2669,19 +2673,24 @@ function distToSegment(
                   const rh = room.heightMeters! * scalePxPerMeter;
                   const wallPx = wallThicknessMeters * scalePxPerMeter;
                   const isSelected = selectedRoomIds.includes(room.id);
-
-                  const outerD = `M ${rx} ${ry} H ${rx + rw} V ${ry + rh} H ${rx} Z`;
-                  const innerD = `M ${rx + wallPx} ${ry + wallPx} V ${ry + rh - wallPx} H ${rx + rw - wallPx} V ${ry + wallPx} Z`;
+                  const strokeWidth = isSelected ? 3.5 : 2;
 
                   return (
-                    <g key={`stroke-room-${room.id}`}>
-                      <path d={outerD} fill="none" stroke="#141414" strokeWidth={isSelected ? '3.5' : '2'} />
-                      <path d={innerD} fill="none" stroke="#141414" strokeWidth={isSelected ? '3.5' : '2'} />
+                    <g key={`outline-room-${room.id}`} strokeWidth={strokeWidth}>
+                      <rect x={rx} y={ry} width={rw} height={rh} />
+                      {rw > wallPx * 2 && rh > wallPx * 2 && (
+                        <rect
+                          x={rx + wallPx}
+                          y={ry + wallPx}
+                          width={rw - wallPx * 2}
+                          height={rh - wallPx * 2}
+                        />
+                      )}
                     </g>
                   );
                 })}
 
-                {/* Custom Wall Border Strokes */}
+                {/* Custom walls always draw both faces. End caps disappear only at real wall connections. */}
                 {floorPlanWalls.map((w) => {
                   const x1 = w.x1Meters * scalePxPerMeter;
                   const y1 = w.y1Meters * scalePxPerMeter;
@@ -2689,6 +2698,7 @@ function distToSegment(
                   const y2 = w.y2Meters * scalePxPerMeter;
                   const thick = (w.thicknessMeters || wallThicknessMeters) * scalePxPerMeter;
                   const isSelected = selectedWallIds.includes(w.id);
+                  const strokeWidth = isSelected ? 3.5 : 2;
 
                   const dx = x2 - x1;
                   const dy = y2 - y1;
@@ -2701,20 +2711,27 @@ function distToSegment(
                   const ny = ux;
                   const h = thick / 2;
 
-                  const sp1 = { x: x1 + nx * h, y: y1 + ny * h };
-                  const sp2 = { x: x2 + nx * h, y: y2 + ny * h };
-                  const sp3 = { x: x2 - nx * h, y: y2 - ny * h };
-                  const sp4 = { x: x1 - nx * h, y: y1 - ny * h };
+                  const p1 = { x: x1 + nx * h, y: y1 + ny * h };
+                  const p2 = { x: x2 + nx * h, y: y2 + ny * h };
+                  const p3 = { x: x2 - nx * h, y: y2 - ny * h };
+                  const p4 = { x: x1 - nx * h, y: y1 - ny * h };
+
+                  const startConnected = isWallEndpointConnected(w, {
+                    x: w.x1Meters,
+                    y: w.y1Meters,
+                  });
+                  const endConnected = isWallEndpointConnected(w, {
+                    x: w.x2Meters,
+                    y: w.y2Meters,
+                  });
 
                   return (
-                    <path
-                      key={`stroke-wall-${w.id}`}
-                      d={`M ${sp1.x} ${sp1.y} L ${sp2.x} ${sp2.y} L ${sp3.x} ${sp3.y} L ${sp4.x} ${sp4.y} Z`}
-                      fill="none"
-                      stroke="#141414"
-                      strokeWidth={isSelected ? '3.5' : '2'}
-                      strokeLinecap="square"
-                    />
+                    <g key={`outline-wall-${w.id}`} strokeWidth={strokeWidth} strokeLinecap="square">
+                      <line x1={p1.x} y1={p1.y} x2={p2.x} y2={p2.y} />
+                      <line x1={p4.x} y1={p4.y} x2={p3.x} y2={p3.y} />
+                      {!startConnected && <line x1={p1.x} y1={p1.y} x2={p4.x} y2={p4.y} />}
+                      {!endConnected && <line x1={p2.x} y1={p2.y} x2={p3.x} y2={p3.y} />}
+                    </g>
                   );
                 })}
               </g>
