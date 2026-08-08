@@ -36,17 +36,19 @@ jobs:
           from pathlib import Path
           path = Path('src/components/FloorPlanEditor.tsx')
           text = path.read_text()
-          duplicate = """              </g>
-
-              </g>
-
-              {/* LAYER 4: Interactive Handlers, Selection Overlays, Labels & Cotas */}"""
-          fixed = """              </g>
-
-              {/* LAYER 4: Interactive Handlers, Selection Overlays, Labels & Cotas */}"""
-          if duplicate not in text:
-              raise SystemExit('Expected duplicate generated wall layer closing tag not found')
-          path.write_text(text.replace(duplicate, fixed, 1))
+          marker = '              {/* LAYER 4: Interactive Handlers, Selection Overlays, Labels & Cotas */}'
+          marker_idx = text.find(marker)
+          if marker_idx < 0:
+              raise SystemExit('Layer 4 marker not found')
+          prefix = text[:marker_idx]
+          last_close = prefix.rfind('</g>')
+          second_close = prefix.rfind('</g>', 0, last_close)
+          if last_close < 0 or second_close < 0:
+              raise SystemExit('Expected wall layer closing tags not found')
+          if prefix[second_close + 4:last_close].strip():
+              raise SystemExit('Wall layer closing tags are not adjacent')
+          text = text[:second_close] + text[second_close + 4:]
+          path.write_text(text)
           print('Generated JSX normalized.')
           PY
 
