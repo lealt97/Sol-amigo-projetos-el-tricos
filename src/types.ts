@@ -166,6 +166,7 @@ export interface SheetSettings {
 
 export interface ProjectSettings {
   projectName: string;
+  projectType?: 'residencial' | 'comercial';
   clientName: string;
   engineerName: string;
   creaNumber: string;
