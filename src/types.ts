@@ -66,10 +66,17 @@ export interface FloorPlanConduit {
 export interface FloorPlanOpening {
   id: string;
   type: 'door' | 'window';
+  // Start point of the opening on the host wall axis, in model meters.
   xMeters: number;
   yMeters: number;
   widthMeters: number; // e.g. 0.8m for door, 1.2m for window
+  // Kept for backward compatibility and quick axis hints.
   orientation: 'horizontal' | 'vertical';
+  // Exact host-wall geometry. Older saved projects may omit these fields.
+  angleDeg?: number;
+  wallId?: string;
+  wallThicknessMeters?: number;
+  wallPositionRatio?: number; // opening center position along a custom wall, 0..1
   roomId?: string;
   label?: string; // e.g. "P1 - 80x210cm", "J1 - 120x100cm"
 }
