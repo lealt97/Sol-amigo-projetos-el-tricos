@@ -30,6 +30,24 @@ jobs:
       - name: Apply draggable element refactor
         run: python3 scripts/refactor-drag-elements.py
 
+      - name: Type drag snapshot maps
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('src/components/FloorPlanEditor.tsx')
+          text = path.read_text()
+          replacements = {
+              "const childSymbols = new Map((elementDrag.childSymbols || []).map((item) => [item.id, item]));": "const childSymbols = new Map<string, FloorPlanSymbol>((elementDrag.childSymbols || []).map((item) => [item.id, item] as const));",
+              "const childOpenings = new Map((elementDrag.childOpenings || []).map((item) => [item.id, item]));": "const childOpenings = new Map<string, FloorPlanOpening>((elementDrag.childOpenings || []).map((item) => [item.id, item] as const));",
+              "const childWalls = new Map((elementDrag.childWalls || []).map((item) => [item.id, item]));": "const childWalls = new Map<string, FloorPlanWall>((elementDrag.childWalls || []).map((item) => [item.id, item] as const));",
+          }
+          for old, new in replacements.items():
+              if old not in text:
+                  raise SystemExit(f'Missing generated line: {old}')
+              text = text.replace(old, new, 1)
+          path.write_text(text)
+          PY
+
       - name: Install dependencies
         run: npm install
 
