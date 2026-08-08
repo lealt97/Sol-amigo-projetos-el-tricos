@@ -60,6 +60,17 @@ type ToolMode =
   | 'add_conduit'
   | 'measure';
 
+const TOOL_META: Record<ToolMode, { label: string; shortcut: string }> = {
+  select: { label: 'Selecionar', shortcut: 'V' },
+  draw_room: { label: 'Cômodo', shortcut: 'R' },
+  draw_wall: { label: 'Parede', shortcut: 'W' },
+  add_door: { label: 'Porta', shortcut: 'D' },
+  add_window: { label: 'Janela', shortcut: 'J' },
+  add_symbol: { label: 'Símbolo elétrico', shortcut: 'E' },
+  add_conduit: { label: 'Eletroduto', shortcut: 'C' },
+  measure: { label: 'Medir / Cota', shortcut: 'M' },
+};
+
 // Palette of architectural room colors
 const ROOM_COLORS = [
   '#F4F4F5', // Light neutral
@@ -84,6 +95,7 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
   const [panOffset, setPanOffset] = useState<{ x: number; y: number }>({ x: 40, y: 40 });
   const [isPanning, setIsPanning] = useState(false);
   const [panStart, setPanStart] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const [isSpacePressed, setIsSpacePressed] = useState(false);
 
   // Tool Modes & Selections
   const [activeTool, setActiveTool] = useState<ToolMode>('select');
@@ -129,7 +141,6 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
   // Architectural Opening Tool State (Portas e Janelas)
   const [doorWidthMeters, setDoorWidthMeters] = useState<number>(0.8); // 80cm standard door
   const [windowWidthMeters, setWindowWidthMeters] = useState<number>(1.2); // 1.20m standard window
-  const [openingOrientation, setOpeningOrientation] = useState<'horizontal' | 'vertical'>('horizontal');
   const [wallThicknessMeters, setWallThicknessMeters] = useState<number>(0.15); // Paredes com espessura dupla de 15cm (padrão NBR)
 
   // Electrical Symbols Tool State
@@ -149,6 +160,7 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
   // Measurement tool state
   const [measureStart, setMeasureStart] = useState<{ x: number; y: number } | null>(null);
   const [measureEnd, setMeasureEnd] = useState<{ x: number; y: number } | null>(null);
+  const [isMeasuring, setIsMeasuring] = useState(false);
 
   // Layer Toggles
   const [showGrid, setShowGrid] = useState(true);
@@ -161,6 +173,7 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
 
   // Sheet Export Modal state
   const [isExportModalOpen, setIsExportModalOpen] = useState(false);
+  const [toolStatus, setToolStatus] = useState('Selecione uma ferramenta para começar.');
 
   const currentSheetSettings: SheetSettings = useMemo(
     () => ({
@@ -181,6 +194,56 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
   );
 
   const canvasRef = useRef<SVGSVGElement>(null);
+
+  const clearSelections = () => {
+    setSelectedRoomIds([]);
+    setSelectedSymbolIds([]);
+    setSelectedOpeningIds([]);
+    setSelectedWallIds([]);
+  };
+
+  const resetTransientGesture = () => {
+    setIsDrawingRoom(false);
+    setDragStartPos(null);
+    setDragCurrentPos(null);
+    setIsDrawingWall(false);
+    setWallStartPos(null);
+    setWallCurrentPos(null);
+    setWallSnapInfo(null);
+    setIsBoxSelecting(false);
+    setSelectionStart(null);
+    setSelectionCurrent(null);
+    setDraggingWallHandle(null);
+    setIsPanning(false);
+    setIsMeasuring(false);
+  };
+
+  const activateTool = (tool: ToolMode) => {
+    resetTransientGesture();
+    if (tool !== 'add_conduit') setConduitFromId(null);
+    if (tool !== 'measure') {
+      setMeasureStart(null);
+      setMeasureEnd(null);
+    }
+    setActiveTool(tool);
+    setToolStatus(`${TOOL_META[tool].label} ativa • ${TOOL_META[tool].shortcut}`);
+  };
+
+  const cancelCurrentOperation = () => {
+    resetTransientGesture();
+    setConduitFromId(null);
+    setMeasureStart(null);
+    setMeasureEnd(null);
+    setActiveTool('select');
+    setToolStatus('Operação cancelada. Ferramenta Selecionar ativa.');
+  };
+
+  const handleCanvasMouseLeave = () => {
+    if (isDrawingRoom || isDrawingWall || isMeasuring) {
+      setToolStatus('Gesto cancelado porque o cursor saiu da área de desenho.');
+    }
+    resetTransientGesture();
+  };
 
   // Ensure rooms have geometry coordinates in meters
   const roomsWithGeometry = useMemo(() => {
@@ -361,9 +424,85 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
     return { x, y, isSnapped, snapInfo, snapTargetPoint };
   };
 
+  const getOpeningPlacementOnWall = (
+    point: { x: number; y: number },
+    widthMeters: number,
+    maxDistanceMeters = Math.max(0.35, gridSnapMeters * 1.5)
+  ): { x: number; y: number; orientation: 'horizontal' | 'vertical'; roomId?: string } | null => {
+    let best:
+      | {
+          x: number;
+          y: number;
+          orientation: 'horizontal' | 'vertical';
+          roomId?: string;
+          distance: number;
+        }
+      | null = null;
+
+    const considerHorizontal = (
+      wallY: number,
+      startX: number,
+      endX: number,
+      roomId?: string
+    ) => {
+      const minX = Math.min(startX, endX);
+      const maxX = Math.max(startX, endX);
+      if (maxX - minX < widthMeters) return;
+      const openingX = Math.min(
+        Math.max(point.x - widthMeters / 2, minX),
+        maxX - widthMeters
+      );
+      const distance = Math.hypot(point.x - (openingX + widthMeters / 2), point.y - wallY);
+      if (!best || distance < best.distance) {
+        best = { x: openingX, y: wallY, orientation: 'horizontal', roomId, distance };
+      }
+    };
+
+    const considerVertical = (
+      wallX: number,
+      startY: number,
+      endY: number,
+      roomId?: string
+    ) => {
+      const minY = Math.min(startY, endY);
+      const maxY = Math.max(startY, endY);
+      if (maxY - minY < widthMeters) return;
+      const openingY = Math.min(
+        Math.max(point.y - widthMeters / 2, minY),
+        maxY - widthMeters
+      );
+      const distance = Math.hypot(point.x - wallX, point.y - (openingY + widthMeters / 2));
+      if (!best || distance < best.distance) {
+        best = { x: wallX, y: openingY, orientation: 'vertical', roomId, distance };
+      }
+    };
+
+    for (const room of roomsWithGeometry) {
+      if (room.x === undefined || room.y === undefined || !room.widthMeters || !room.heightMeters) continue;
+      considerHorizontal(room.y, room.x, room.x + room.widthMeters, room.id);
+      considerHorizontal(room.y + room.heightMeters, room.x, room.x + room.widthMeters, room.id);
+      considerVertical(room.x, room.y, room.y + room.heightMeters, room.id);
+      considerVertical(room.x + room.widthMeters, room.y, room.y + room.heightMeters, room.id);
+    }
+
+    for (const wall of floorPlanWalls) {
+      const dx = wall.x2Meters - wall.x1Meters;
+      const dy = wall.y2Meters - wall.y1Meters;
+      if (Math.abs(dx) >= Math.abs(dy) * 4) {
+        considerHorizontal((wall.y1Meters + wall.y2Meters) / 2, wall.x1Meters, wall.x2Meters);
+      } else if (Math.abs(dy) >= Math.abs(dx) * 4) {
+        considerVertical((wall.x1Meters + wall.x2Meters) / 2, wall.y1Meters, wall.y2Meters);
+      }
+    }
+
+    if (!best || best.distance > maxDistanceMeters) return null;
+    const { distance: _distance, ...placement } = best;
+    return placement;
+  };
+
   // Canvas Mouse Down
   const handleMouseDown = (e: React.MouseEvent<SVGSVGElement>) => {
-    if (e.button === 1 || (e.button === 0 && e.shiftKey && activeTool !== 'select')) {
+    if (e.button === 1 || (e.button === 0 && isSpacePressed)) {
       setIsPanning(true);
       setPanStart({ x: e.clientX - panOffset.x, y: e.clientY - panOffset.y });
       return;
@@ -392,15 +531,21 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
       setWallCurrentPos({ x: snap.x, y: snap.y });
       setWallSnapInfo(snap);
     } else if (activeTool === 'add_door') {
-      // Place door
+      const placement = getOpeningPlacementOnWall(coords, doorWidthMeters);
+      if (!placement) {
+        setToolStatus('Porta não inserida: aproxime o cursor de uma parede.');
+        return;
+      }
+
       const doorCount = floorPlanOpenings.filter((o) => o.type === 'door').length + 1;
       const newDoor: FloorPlanOpening = {
         id: `door_${Date.now()}`,
         type: 'door',
-        xMeters: coords.x,
-        yMeters: coords.y,
+        xMeters: placement.x,
+        yMeters: placement.y,
         widthMeters: doorWidthMeters,
-        orientation: openingOrientation,
+        orientation: placement.orientation,
+        roomId: placement.roomId,
         label: `P${doorCount} (${Math.round(doorWidthMeters * 100)}cm)`,
       };
 
@@ -415,16 +560,23 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
           walls: floorPlanWalls,
         },
       });
+      setToolStatus(`Porta P${doorCount} inserida e alinhada à parede.`);
     } else if (activeTool === 'add_window') {
-      // Place window
+      const placement = getOpeningPlacementOnWall(coords, windowWidthMeters);
+      if (!placement) {
+        setToolStatus('Janela não inserida: aproxime o cursor de uma parede.');
+        return;
+      }
+
       const windowCount = floorPlanOpenings.filter((o) => o.type === 'window').length + 1;
       const newWindow: FloorPlanOpening = {
         id: `win_${Date.now()}`,
         type: 'window',
-        xMeters: coords.x,
-        yMeters: coords.y,
+        xMeters: placement.x,
+        yMeters: placement.y,
         widthMeters: windowWidthMeters,
-        orientation: openingOrientation,
+        orientation: placement.orientation,
+        roomId: placement.roomId,
         label: `J${windowCount} (${Math.round(windowWidthMeters * 100)}cm)`,
       };
 
@@ -439,6 +591,7 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
           walls: floorPlanWalls,
         },
       });
+      setToolStatus(`Janela J${windowCount} inserida e alinhada à parede.`);
     } else if (activeTool === 'add_symbol') {
       // Place electrical symbol
       const newSymbol: FloorPlanSymbol = {
@@ -466,6 +619,8 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
     } else if (activeTool === 'measure') {
       setMeasureStart(coords);
       setMeasureEnd(coords);
+      setIsMeasuring(true);
+      setToolStatus('Arraste até o ponto final da medição.');
     }
   };
 
@@ -564,7 +719,7 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
       const snap = getSmartWallCoords(coords, wallStartPos, e.shiftKey);
       setWallCurrentPos({ x: snap.x, y: snap.y });
       setWallSnapInfo(snap);
-    } else if (activeTool === 'measure' && measureStart) {
+    } else if (isMeasuring && measureStart) {
       setMeasureEnd(coords);
     }
   };
@@ -584,6 +739,12 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
       setIsBoxSelecting(false);
       setSelectionStart(null);
       setSelectionCurrent(null);
+      return;
+    }
+
+    if (isMeasuring) {
+      setIsMeasuring(false);
+      setToolStatus('Medição concluída. Arraste novamente para medir outra distância.');
       return;
     }
 
@@ -767,19 +928,48 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
     setSelectedRoomIds([]);
   };
 
-  // Keyboard shortcut listener for Delete & Backspace keys
+  // Keyboard shortcuts and command cancellation
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      // Ignore if typing in an input, textarea or select element
       const target = e.target as HTMLElement | null;
-      if (
+      const isTyping =
         target &&
         (target.tagName === 'INPUT' ||
           target.tagName === 'TEXTAREA' ||
           target.tagName === 'SELECT' ||
-          target.isContentEditable)
-      ) {
+          target.isContentEditable);
+
+      if (isTyping) return;
+
+      if (e.code === 'Space') {
+        e.preventDefault();
+        setIsSpacePressed(true);
         return;
+      }
+
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        cancelCurrentOperation();
+        return;
+      }
+
+      if (!e.ctrlKey && !e.metaKey && !e.altKey) {
+        const shortcutMap: Record<string, ToolMode> = {
+          v: 'select',
+          r: 'draw_room',
+          w: 'draw_wall',
+          d: 'add_door',
+          j: 'add_window',
+          e: 'add_symbol',
+          c: 'add_conduit',
+          m: 'measure',
+        };
+        const nextTool = shortcutMap[e.key.toLowerCase()];
+        if (nextTool) {
+          e.preventDefault();
+          activateTool(nextTool);
+          return;
+        }
       }
 
       if (e.key === 'Delete' || e.key === 'Backspace') {
@@ -790,9 +980,19 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
       }
     };
 
+    const handleKeyUp = (e: KeyboardEvent) => {
+      if (e.code === 'Space') setIsSpacePressed(false);
+    };
+
+    const handleWindowBlur = () => setIsSpacePressed(false);
+
     window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+    window.addEventListener('blur', handleWindowBlur);
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+      window.removeEventListener('blur', handleWindowBlur);
     };
   }, [
     totalSelectedCount,
@@ -1337,7 +1537,7 @@ function distToSegment(
                 Planta Baixa Arquitetônica & Elétrica CAD (Com Escala Real)
               </h3>
               <p className="text-xs opacity-70">
-                Desenho de cômodos, portas, janelas, fiação e símbolos ABNT NBR 5444 à escala
+                Desenho de cômodos, portas, janelas, fiação e símbolos elétricos em escala
               </p>
             </div>
           </div>
@@ -1357,12 +1557,7 @@ function distToSegment(
                   <span>Excluir (Del)</span>
                 </button>
                 <button
-                  onClick={() => {
-                    setSelectedSymbolIds([]);
-                    setSelectedOpeningIds([]);
-                    setSelectedWallIds([]);
-                    setSelectedRoomIds([]);
-                  }}
+                  onClick={clearSelections}
                   className="text-stone-700 hover:text-black font-bold text-xs underline cursor-pointer ml-1"
                 >
                   Limpar
@@ -1383,88 +1578,88 @@ function distToSegment(
         <div className="flex flex-wrap items-center justify-between gap-3 text-xs">
           <div className="flex items-center gap-1 bg-[#E4E3E0]/50 p-1 border border-[#141414]">
             <button
-              onClick={() => setActiveTool('select')}
+              onClick={() => activateTool('select')}
               className={`px-3 py-1 font-bold uppercase flex items-center gap-1 transition-colors cursor-pointer ${
                 activeTool === 'select' ? 'bg-[#141414] text-[#E4E3E0]' : 'hover:bg-white'
               }`}
-              title="Selecionar por Clique/Arrasto e Mover Objetos"
+              title="Selecionar por clique ou janela • atalho V"
             >
               <MousePointer className="w-3.5 h-3.5" />
-              <span>Selecionar / Mover</span>
+              <span>Selecionar</span>
             </button>
 
             <button
-              onClick={() => setActiveTool('draw_room')}
+              onClick={() => activateTool('draw_room')}
               className={`px-3 py-1 font-bold uppercase flex items-center gap-1 transition-colors cursor-pointer ${
                 activeTool === 'draw_room' ? 'bg-[#141414] text-[#E4E3E0]' : 'hover:bg-white'
               }`}
-              title="Desenhar Cômodo a Escala (Arrastar no Canvas)"
+              title="Desenhar cômodo • atalho R"
             >
               <Square className="w-3.5 h-3.5" />
               <span>Desenhar Cômodo</span>
             </button>
 
             <button
-              onClick={() => setActiveTool('draw_wall')}
+              onClick={() => activateTool('draw_wall')}
               className={`px-3 py-1 font-bold uppercase flex items-center gap-1 transition-colors cursor-pointer ${
                 activeTool === 'draw_wall' ? 'bg-[#141414] text-[#E4E3E0]' : 'hover:bg-white'
               }`}
-              title="Desenhar Parede Dupla a Partir de Qualquer Canto ou Ponto"
+              title="Desenhar parede • atalho W • Shift trava ortogonal"
             >
               <PenTool className="w-3.5 h-3.5" />
               <span>Desenhar Parede</span>
             </button>
 
             <button
-              onClick={() => setActiveTool('add_door')}
+              onClick={() => activateTool('add_door')}
               className={`px-3 py-1 font-bold uppercase flex items-center gap-1 transition-colors cursor-pointer ${
                 activeTool === 'add_door' ? 'bg-[#141414] text-[#E4E3E0]' : 'hover:bg-white'
               }`}
-              title="Inserir Porta com Arco de Giro"
+              title="Inserir porta sobre uma parede • atalho D"
             >
               <DoorOpen className="w-3.5 h-3.5" />
               <span>Inserir Porta</span>
             </button>
 
             <button
-              onClick={() => setActiveTool('add_window')}
+              onClick={() => activateTool('add_window')}
               className={`px-3 py-1 font-bold uppercase flex items-center gap-1 transition-colors cursor-pointer ${
                 activeTool === 'add_window' ? 'bg-[#141414] text-[#E4E3E0]' : 'hover:bg-white'
               }`}
-              title="Inserir Janela com Vidros"
+              title="Inserir janela sobre uma parede • atalho J"
             >
               <Maximize className="w-3.5 h-3.5" />
               <span>Inserir Janela</span>
             </button>
 
             <button
-              onClick={() => setActiveTool('add_symbol')}
+              onClick={() => activateTool('add_symbol')}
               className={`px-3 py-1 font-bold uppercase flex items-center gap-1 transition-colors cursor-pointer ${
                 activeTool === 'add_symbol' ? 'bg-[#141414] text-[#E4E3E0]' : 'hover:bg-white'
               }`}
-              title="Inserir Símbolo Elétrico NBR 5444"
+              title="Inserir símbolo elétrico • atalho E"
             >
               <Zap className="w-3.5 h-3.5" />
               <span>Símbolo Elétrico</span>
             </button>
 
             <button
-              onClick={() => setActiveTool('add_conduit')}
+              onClick={() => activateTool('add_conduit')}
               className={`px-3 py-1 font-bold uppercase flex items-center gap-1 transition-colors cursor-pointer ${
                 activeTool === 'add_conduit' ? 'bg-[#141414] text-[#E4E3E0]' : 'hover:bg-white'
               }`}
-              title="Ligar Eletroduto"
+              title="Ligar eletroduto entre símbolos • atalho C"
             >
               <ArrowRight className="w-3.5 h-3.5" />
               <span>Eletroduto</span>
             </button>
 
             <button
-              onClick={() => setActiveTool('measure')}
+              onClick={() => activateTool('measure')}
               className={`px-3 py-1 font-bold uppercase flex items-center gap-1 transition-colors cursor-pointer ${
                 activeTool === 'measure' ? 'bg-[#141414] text-[#E4E3E0]' : 'hover:bg-white'
               }`}
-              title="Régua de Cotas e Medição"
+              title="Medir distância • atalho M"
             >
               <Ruler className="w-3.5 h-3.5" />
               <span>Cotas</span>
@@ -1481,7 +1676,7 @@ function distToSegment(
                 className="bg-white border border-[#141414] px-2 py-1 text-xs font-bold cursor-pointer"
               >
                 <option value={0.10}>10 cm (Divisória)</option>
-                <option value={0.15}>15 cm (Padrão NBR)</option>
+                <option value={0.15}>15 cm (Padrão)</option>
                 <option value={0.20}>20 cm (Externa)</option>
               </select>
             </div>
@@ -1601,6 +1796,11 @@ function distToSegment(
           </div>
         </div>
 
+        <div className="flex flex-wrap items-center justify-between gap-2 border border-[#141414] bg-[#141414] text-[#E4E3E0] px-3 py-2 text-[10px] font-bold uppercase">
+          <span>Ferramenta: <strong className="text-amber-400">{TOOL_META[activeTool].label}</strong> — {toolStatus}</span>
+          <span className="opacity-80">Esc cancela • Espaço + arrastar move a vista • Shift trava parede • V/R/W/D/J/E/C/M</span>
+        </div>
+
         {/* Dynamic Tool Option Panels */}
         {activeTool === 'draw_wall' && (
           <div className="bg-[#E4E3E0]/60 p-2.5 border border-[#141414] flex flex-wrap items-center gap-4 text-xs">
@@ -1615,7 +1815,7 @@ function distToSegment(
                 className="bg-white border border-[#141414] px-2 py-1 font-bold cursor-pointer"
               >
                 <option value={0.10}>10 cm (Divisória)</option>
-                <option value={0.15}>15 cm (Padrão NBR)</option>
+                <option value={0.15}>15 cm (Padrão)</option>
                 <option value={0.20}>20 cm (Externa / Estrutural)</option>
               </select>
             </div>
@@ -1643,16 +1843,8 @@ function distToSegment(
               </select>
             </div>
 
-            <div className="flex items-center gap-1">
-              <label className="font-bold">Orientação:</label>
-              <select
-                value={openingOrientation}
-                onChange={(e) => setOpeningOrientation(e.target.value as 'horizontal' | 'vertical')}
-                className="bg-white border border-[#141414] px-2 py-1 font-bold cursor-pointer"
-              >
-                <option value="horizontal">Horizontal (Parede Norte/Sul)</option>
-                <option value="vertical">Vertical (Parede Leste/Oeste)</option>
-              </select>
+            <div className="bg-white border border-[#141414] px-2 py-1 font-bold">
+              Orientação automática pela parede
             </div>
 
             <span className="text-[10px] font-bold text-emerald-800">
@@ -1681,16 +1873,8 @@ function distToSegment(
               </select>
             </div>
 
-            <div className="flex items-center gap-1">
-              <label className="font-bold">Orientação:</label>
-              <select
-                value={openingOrientation}
-                onChange={(e) => setOpeningOrientation(e.target.value as 'horizontal' | 'vertical')}
-                className="bg-white border border-[#141414] px-2 py-1 font-bold cursor-pointer"
-              >
-                <option value="horizontal">Horizontal (Parede Norte/Sul)</option>
-                <option value="vertical">Vertical (Parede Leste/Oeste)</option>
-              </select>
+            <div className="bg-white border border-[#141414] px-2 py-1 font-bold">
+              Orientação automática pela parede
             </div>
 
             <span className="text-[10px] font-bold text-emerald-800">
@@ -1701,7 +1885,7 @@ function distToSegment(
 
         {activeTool === 'add_symbol' && (
           <div className="bg-[#E4E3E0]/60 p-2.5 border border-[#141414] flex flex-wrap items-center gap-4 text-xs">
-            <span className="font-black uppercase">Símbolo NBR 5444:</span>
+            <span className="font-black uppercase">Símbolo elétrico:</span>
             <div className="flex items-center gap-1">
               <label className="font-bold">Tipo:</label>
               <select
@@ -1771,10 +1955,12 @@ function distToSegment(
             ref={canvasRef}
             width={1200}
             height={800}
-            className="bg-[#FAFAFA] font-mono cursor-crosshair"
+            className="bg-[#FAFAFA] font-mono"
+            style={{ cursor: isPanning ? 'grabbing' : isSpacePressed ? 'grab' : activeTool === 'select' ? 'default' : 'crosshair' }}
             onMouseDown={handleMouseDown}
             onMouseMove={handleMouseMove}
             onMouseUp={handleMouseUp}
+            onMouseLeave={handleCanvasMouseLeave}
           >
             {/* SVG Grid Pattern */}
             <defs>
