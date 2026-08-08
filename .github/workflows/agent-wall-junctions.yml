@@ -1,0 +1,53 @@
+name: Agent wall junctions
+
+on:
+  push:
+    branches:
+      - agent/wall-junctions
+
+permissions:
+  contents: write
+
+concurrency:
+  group: agent-wall-junctions
+  cancel-in-progress: true
+
+jobs:
+  refactor-and-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/wall-junctions
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Apply wall junction refactor
+        run: python3 scripts/refactor-wall-junctions.py
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: TypeScript validation
+        run: npm run lint
+
+      - name: Production build
+        run: npm run build
+
+      - name: Commit validated changes
+        run: |
+          rm -f scripts/refactor-wall-junctions.py .github/workflows/agent-wall-junctions.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/components/FloorPlanEditor.tsx scripts/refactor-wall-junctions.py .github/workflows/agent-wall-junctions.yml || true
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git commit -m "fix: connect wall junctions precisely"
+          git push origin HEAD:agent/wall-junctions
