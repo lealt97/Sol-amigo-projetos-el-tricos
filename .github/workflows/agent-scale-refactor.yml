@@ -20,7 +20,7 @@ jobs:
           ref: agent/scale-denominator-refactor
 
       - name: Setup Node.js
-        uses: actions/setup-node@7
+        uses: actions/setup-node@v7
         with:
           node-version: 24
 
