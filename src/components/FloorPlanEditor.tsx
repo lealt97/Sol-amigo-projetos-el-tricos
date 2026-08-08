@@ -77,6 +77,17 @@ interface ElementDragState {
   childWalls?: FloorPlanWall[];
 }
 
+interface OpeningPlacement {
+  x: number;
+  y: number;
+  orientation: 'horizontal' | 'vertical';
+  angleDeg: number;
+  wallThicknessMeters: number;
+  wallPositionRatio: number;
+  roomId?: string;
+  wallId?: string;
+}
+
 const TOOL_META: Record<ToolMode, { label: string; shortcut: string }> = {
   select: { label: 'Selecionar / Mover', shortcut: 'V' },
   draw_room: { label: 'Cômodo', shortcut: 'R' },
@@ -549,80 +560,182 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
     return { x, y, isSnapped, snapInfo, snapTargetPoint };
   };
 
+  const getOpeningPlacementOnSegment = (
+    point: { x: number; y: number },
+    widthMeters: number,
+    start: { x: number; y: number },
+    end: { x: number; y: number },
+    thicknessMeters: number,
+    metadata: { roomId?: string; wallId?: string } = {}
+  ): (OpeningPlacement & { distance: number }) | null => {
+    const dx = end.x - start.x;
+    const dy = end.y - start.y;
+    const length = Math.hypot(dx, dy);
+    if (length < widthMeters || length < 1e-6) return null;
+
+    const ux = dx / length;
+    const uy = dy / length;
+    const rawAlong = (point.x - start.x) * ux + (point.y - start.y) * uy;
+    const projectedAlong = Math.max(0, Math.min(length, rawAlong));
+    const projectedX = start.x + ux * projectedAlong;
+    const projectedY = start.y + uy * projectedAlong;
+
+    const halfWidth = widthMeters / 2;
+    const centerAlong = Math.max(halfWidth, Math.min(length - halfWidth, rawAlong));
+    const centerX = start.x + ux * centerAlong;
+    const centerY = start.y + uy * centerAlong;
+    const openingStartX = centerX - ux * halfWidth;
+    const openingStartY = centerY - uy * halfWidth;
+    const angleDeg = (Math.atan2(dy, dx) * 180) / Math.PI;
+
+    return {
+      x: openingStartX,
+      y: openingStartY,
+      orientation: Math.abs(dx) >= Math.abs(dy) ? 'horizontal' : 'vertical',
+      angleDeg,
+      wallThicknessMeters: thicknessMeters,
+      wallPositionRatio: length > 0 ? centerAlong / length : 0.5,
+      ...metadata,
+      distance: Math.hypot(point.x - projectedX, point.y - projectedY),
+    };
+  };
+
   const getOpeningPlacementOnWall = (
     point: { x: number; y: number },
     widthMeters: number,
     maxDistanceMeters = Math.max(0.35, gridSnapMeters * 1.5)
-  ): { x: number; y: number; orientation: 'horizontal' | 'vertical'; roomId?: string } | null => {
-    let best:
-      | {
-          x: number;
-          y: number;
-          orientation: 'horizontal' | 'vertical';
-          roomId?: string;
-          distance: number;
-        }
-      | null = null;
-
-    const considerHorizontal = (
-      wallY: number,
-      startX: number,
-      endX: number,
-      roomId?: string
-    ) => {
-      const minX = Math.min(startX, endX);
-      const maxX = Math.max(startX, endX);
-      if (maxX - minX < widthMeters) return;
-      const openingX = Math.min(
-        Math.max(point.x - widthMeters / 2, minX),
-        maxX - widthMeters
-      );
-      const distance = Math.hypot(point.x - (openingX + widthMeters / 2), point.y - wallY);
-      if (!best || distance < best.distance) {
-        best = { x: openingX, y: wallY, orientation: 'horizontal', roomId, distance };
-      }
+  ): OpeningPlacement | null => {
+    let best: (OpeningPlacement & { distance: number }) | null = null;
+    const consider = (candidate: (OpeningPlacement & { distance: number }) | null) => {
+      if (candidate && (!best || candidate.distance < best.distance)) best = candidate;
     };
 
-    const considerVertical = (
-      wallX: number,
-      startY: number,
-      endY: number,
-      roomId?: string
-    ) => {
-      const minY = Math.min(startY, endY);
-      const maxY = Math.max(startY, endY);
-      if (maxY - minY < widthMeters) return;
-      const openingY = Math.min(
-        Math.max(point.y - widthMeters / 2, minY),
-        maxY - widthMeters
-      );
-      const distance = Math.hypot(point.x - wallX, point.y - (openingY + widthMeters / 2));
-      if (!best || distance < best.distance) {
-        best = { x: wallX, y: openingY, orientation: 'vertical', roomId, distance };
-      }
-    };
-
+    // Room walls are drawn inward from the architectural outer rectangle, so openings
+    // must sit on the centerline of that wall thickness rather than on the outer edge.
     for (const room of roomsWithGeometry) {
       if (room.x === undefined || room.y === undefined || !room.widthMeters || !room.heightMeters) continue;
-      considerHorizontal(room.y, room.x, room.x + room.widthMeters, room.id);
-      considerHorizontal(room.y + room.heightMeters, room.x, room.x + room.widthMeters, room.id);
-      considerVertical(room.x, room.y, room.y + room.heightMeters, room.id);
-      considerVertical(room.x + room.widthMeters, room.y, room.y + room.heightMeters, room.id);
+      const left = room.x;
+      const top = room.y;
+      const right = room.x + room.widthMeters;
+      const bottom = room.y + room.heightMeters;
+      const h = wallThicknessMeters / 2;
+
+      consider(getOpeningPlacementOnSegment(
+        point,
+        widthMeters,
+        { x: left, y: top + h },
+        { x: right, y: top + h },
+        wallThicknessMeters,
+        { roomId: room.id }
+      ));
+      consider(getOpeningPlacementOnSegment(
+        point,
+        widthMeters,
+        { x: left, y: bottom - h },
+        { x: right, y: bottom - h },
+        wallThicknessMeters,
+        { roomId: room.id }
+      ));
+      consider(getOpeningPlacementOnSegment(
+        point,
+        widthMeters,
+        { x: left + h, y: top },
+        { x: left + h, y: bottom },
+        wallThicknessMeters,
+        { roomId: room.id }
+      ));
+      consider(getOpeningPlacementOnSegment(
+        point,
+        widthMeters,
+        { x: right - h, y: top },
+        { x: right - h, y: bottom },
+        wallThicknessMeters,
+        { roomId: room.id }
+      ));
     }
 
+    // Custom walls support any angle and use their own stored thickness.
     for (const wall of floorPlanWalls) {
-      const dx = wall.x2Meters - wall.x1Meters;
-      const dy = wall.y2Meters - wall.y1Meters;
-      if (Math.abs(dx) >= Math.abs(dy) * 4) {
-        considerHorizontal((wall.y1Meters + wall.y2Meters) / 2, wall.x1Meters, wall.x2Meters);
-      } else if (Math.abs(dy) >= Math.abs(dx) * 4) {
-        considerVertical((wall.x1Meters + wall.x2Meters) / 2, wall.y1Meters, wall.y2Meters);
-      }
+      consider(getOpeningPlacementOnSegment(
+        point,
+        widthMeters,
+        { x: wall.x1Meters, y: wall.y1Meters },
+        { x: wall.x2Meters, y: wall.y2Meters },
+        wall.thicknessMeters || wallThicknessMeters,
+        { wallId: wall.id }
+      ));
     }
 
     if (!best || best.distance > maxDistanceMeters) return null;
     const { distance: _distance, ...placement } = best;
     return placement;
+  };
+
+  const getResolvedOpeningPlacement = (opening: FloorPlanOpening): OpeningPlacement => {
+    // A custom-wall opening remains attached even when that wall is moved, rotated or resized.
+    if (opening.wallId) {
+      const wall = floorPlanWalls.find((item) => item.id === opening.wallId);
+      if (wall) {
+        const dx = wall.x2Meters - wall.x1Meters;
+        const dy = wall.y2Meters - wall.y1Meters;
+        const ratio = Math.max(0, Math.min(1, opening.wallPositionRatio ?? 0.5));
+        const targetCenter = {
+          x: wall.x1Meters + dx * ratio,
+          y: wall.y1Meters + dy * ratio,
+        };
+        const anchored = getOpeningPlacementOnSegment(
+          targetCenter,
+          opening.widthMeters,
+          { x: wall.x1Meters, y: wall.y1Meters },
+          { x: wall.x2Meters, y: wall.y2Meters },
+          wall.thicknessMeters || wallThicknessMeters,
+          { wallId: wall.id }
+        );
+        if (anchored) {
+          const { distance: _distance, ...placement } = anchored;
+          return placement;
+        }
+      }
+    }
+
+    // New openings already store exact axis/angle data.
+    if (Number.isFinite(opening.angleDeg)) {
+      return {
+        x: opening.xMeters,
+        y: opening.yMeters,
+        orientation: opening.orientation,
+        angleDeg: opening.angleDeg ?? (opening.orientation === 'horizontal' ? 0 : 90),
+        wallThicknessMeters: opening.roomId
+          ? wallThicknessMeters
+          : (opening.wallThicknessMeters || wallThicknessMeters),
+        wallPositionRatio: opening.wallPositionRatio ?? 0.5,
+        roomId: opening.roomId,
+        wallId: opening.wallId,
+      };
+    }
+
+    // Legacy saved projects stored room openings on the outer wall edge. Resolve them to
+    // the nearest real wall centerline at render time so old drawings are fixed too.
+    const legacyCenter = opening.orientation === 'horizontal'
+      ? { x: opening.xMeters + opening.widthMeters / 2, y: opening.yMeters }
+      : { x: opening.xMeters, y: opening.yMeters + opening.widthMeters / 2 };
+    const migrated = getOpeningPlacementOnWall(
+      legacyCenter,
+      opening.widthMeters,
+      Math.max(0.8, gridSnapMeters * 3)
+    );
+    if (migrated) return migrated;
+
+    return {
+      x: opening.xMeters,
+      y: opening.yMeters,
+      orientation: opening.orientation,
+      angleDeg: opening.orientation === 'horizontal' ? 0 : 90,
+      wallThicknessMeters: wallThicknessMeters,
+      wallPositionRatio: 0.5,
+      roomId: opening.roomId,
+      wallId: opening.wallId,
+    };
   };
 
   const selectElementForDrag = (kind: DragElementKind, id: string, additive: boolean) => {
@@ -689,7 +802,13 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
     if (kind === 'opening') {
       const opening = floorPlanOpenings.find((item) => item.id === id);
       if (!opening) return;
-      setElementDrag({ kind, id, startPointer, opening: { ...opening } });
+      const resolved = getResolvedOpeningPlacement(opening);
+      setElementDrag({
+        kind,
+        id,
+        startPointer,
+        opening: { ...opening, ...resolved },
+      });
       setToolStatus(`Arrastando ${opening.type === 'door' ? 'porta' : 'janela'} sobre as paredes.`);
       return;
     }
@@ -745,6 +864,10 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
         yMeters: placement.y,
         widthMeters: doorWidthMeters,
         orientation: placement.orientation,
+        angleDeg: placement.angleDeg,
+        wallId: placement.wallId,
+        wallThicknessMeters: placement.wallThicknessMeters,
+        wallPositionRatio: placement.wallPositionRatio,
         roomId: placement.roomId,
         label: `P${doorCount} (${Math.round(doorWidthMeters * 100)}cm)`,
       };
@@ -776,6 +899,10 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
         yMeters: placement.y,
         widthMeters: windowWidthMeters,
         orientation: placement.orientation,
+        angleDeg: placement.angleDeg,
+        wallId: placement.wallId,
+        wallThicknessMeters: placement.wallThicknessMeters,
+        wallPositionRatio: placement.wallPositionRatio,
         roomId: placement.roomId,
         label: `J${windowCount} (${Math.round(windowWidthMeters * 100)}cm)`,
       };
@@ -928,11 +1055,12 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
 
       if (elementDrag.kind === 'opening' && elementDrag.opening) {
         const origin = elementDrag.opening;
-        const desiredX = origin.xMeters + deltaX;
-        const desiredY = origin.yMeters + deltaY;
-        const desiredCenter = origin.orientation === 'horizontal'
-          ? { x: desiredX + origin.widthMeters / 2, y: desiredY }
-          : { x: desiredX, y: desiredY + origin.widthMeters / 2 };
+        const angleDeg = origin.angleDeg ?? (origin.orientation === 'horizontal' ? 0 : 90);
+        const angleRad = (angleDeg * Math.PI) / 180;
+        const desiredCenter = {
+          x: origin.xMeters + Math.cos(angleRad) * origin.widthMeters / 2 + deltaX,
+          y: origin.yMeters + Math.sin(angleRad) * origin.widthMeters / 2 + deltaY,
+        };
         const placement = getOpeningPlacementOnWall(
           desiredCenter,
           origin.widthMeters,
@@ -947,6 +1075,10 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
                   xMeters: placement.x,
                   yMeters: placement.y,
                   orientation: placement.orientation,
+                  angleDeg: placement.angleDeg,
+                  wallId: placement.wallId,
+                  wallThicknessMeters: placement.wallThicknessMeters,
+                  wallPositionRatio: placement.wallPositionRatio,
                   roomId: placement.roomId,
                 }
               : opening
@@ -1687,111 +1819,122 @@ function distToSegment(
 
   // Architectural Render for Doors & Windows
   const renderArchitecturalOpening = (op: FloorPlanOpening) => {
-    const x = op.xMeters * scalePxPerMeter;
-    const y = op.yMeters * scalePxPerMeter;
+    const resolved = getResolvedOpeningPlacement(op);
+    const x = resolved.x * scalePxPerMeter;
+    const y = resolved.y * scalePxPerMeter;
     const w = op.widthMeters * scalePxPerMeter;
-    const wallPx = wallThicknessMeters * scalePxPerMeter;
+    const wallPx = resolved.wallThicknessMeters * scalePxPerMeter;
+    const angleDeg = resolved.angleDeg;
+    const halfWall = wallPx / 2;
     const isSelected = selectedOpeningIds.includes(op.id);
 
     const handleOpeningMouseDown = (e: React.MouseEvent<SVGGElement>) => {
       if (activeTool === 'select') startElementDrag('opening', op.id, e);
     };
 
+    const cutWall = (
+      <rect
+        x="0"
+        y={-halfWall - 2.5}
+        width={w}
+        height={wallPx + 5}
+        fill="#FAFAFA"
+        stroke="none"
+        pointerEvents="none"
+      />
+    );
+
     if (op.type === 'door') {
-      if (op.orientation === 'horizontal') {
-        return (
-          <g key={op.id} onMouseDown={handleOpeningMouseDown} className="cursor-grab active:cursor-grabbing">
-            {/* Wall Cut box spanning double wall thickness */}
-            <rect x={x} y={y - wallPx / 2} width={w} height={wallPx} fill="#FAFAFA" stroke="#141414" strokeWidth="1.5" />
-            {/* Door Leaf line pivoted at left */}
-            <line x1={x} y1={y + wallPx / 2} x2={x} y2={y + wallPx / 2 - w} stroke="#141414" strokeWidth="2.5" />
-            {/* Opening Arc */}
-            <path
-              d={`M ${x + w} ${y + wallPx / 2} A ${w} ${w} 0 0 0 ${x} ${y + wallPx / 2 - w}`}
+      return (
+        <g
+          key={op.id}
+          transform={`translate(${x}, ${y}) rotate(${angleDeg})`}
+          onMouseDown={handleOpeningMouseDown}
+          className="cursor-grab active:cursor-grabbing"
+        >
+          {/* Exact wall cut: removes both wall-face strokes only inside the opening span. */}
+          {cutWall}
+
+          {/* Jambs reconnect precisely to the two black wall faces. */}
+          <line x1="0" y1={-halfWall} x2="0" y2={halfWall} stroke="#141414" strokeWidth="2.5" />
+          <line x1={w} y1={-halfWall} x2={w} y2={halfWall} stroke="#141414" strokeWidth="2.5" />
+
+          {/* Door leaf and swing arc use the same host-wall axis, including angled walls. */}
+          <line x1="0" y1={halfWall} x2="0" y2={halfWall - w} stroke="#141414" strokeWidth="2.5" />
+          <path
+            d={`M ${w} ${halfWall} A ${w} ${w} 0 0 0 0 ${halfWall - w}`}
+            fill="none"
+            stroke="#141414"
+            strokeWidth="1.5"
+            strokeDasharray="3 2"
+          />
+
+          <text
+            x={w / 2}
+            y={halfWall + 14}
+            fill="#141414"
+            fontSize="9"
+            fontWeight="black"
+            textAnchor="middle"
+          >
+            {op.label || 'PORTA'}
+          </text>
+
+          {isSelected && (
+            <rect
+              x="-3"
+              y={halfWall - w - 4}
+              width={w + 6}
+              height={w + wallPx + 21}
               fill="none"
-              stroke="#141414"
-              strokeWidth="1.5"
-              strokeDasharray="3 2"
+              stroke="#ef4444"
+              strokeWidth="2"
+              strokeDasharray="3 3"
             />
-            {/* Frame endpoints */}
-            <line x1={x} y1={y - wallPx / 2 - 2} x2={x} y2={y + wallPx / 2 + 2} stroke="#141414" strokeWidth="2.5" />
-            <line x1={x + w} y1={y - wallPx / 2 - 2} x2={x + w} y2={y + wallPx / 2 + 2} stroke="#141414" strokeWidth="2.5" />
-
-            {/* Label */}
-            <text x={x + w / 2} y={y + wallPx / 2 + 14} fill="#141414" fontSize="9" fontWeight="black" textAnchor="middle">
-              {op.label || 'PORTA'}
-            </text>
-
-            {isSelected && (
-              <rect x={x - 2} y={y - w - 2} width={w + 4} height={w + 20} fill="none" stroke="#ef4444" strokeWidth="2" strokeDasharray="3 3" />
-            )}
-          </g>
-        );
-      } else {
-        // Vertical door
-        return (
-          <g key={op.id} onMouseDown={handleOpeningMouseDown} className="cursor-grab active:cursor-grabbing">
-            <rect x={x - wallPx / 2} y={y} width={wallPx} height={w} fill="#FAFAFA" stroke="#141414" strokeWidth="1.5" />
-            <line x1={x + wallPx / 2} y1={y} x2={x + wallPx / 2 + w} y2={y} stroke="#141414" strokeWidth="2.5" />
-            <path
-              d={`M ${x + wallPx / 2} ${y + w} A ${w} ${w} 0 0 0 ${x + wallPx / 2 + w} ${y}`}
-              fill="none"
-              stroke="#141414"
-              strokeWidth="1.5"
-              strokeDasharray="3 2"
-            />
-            <line x1={x - wallPx / 2 - 2} y1={y} x2={x + wallPx / 2 + 2} y2={y} stroke="#141414" strokeWidth="2.5" />
-            <line x1={x - wallPx / 2 - 2} y1={y + w} x2={x + wallPx / 2 + 2} y2={y + w} stroke="#141414" strokeWidth="2.5" />
-
-            <text x={x + wallPx / 2 + 14} y={y + w / 2} fill="#141414" fontSize="9" fontWeight="black" textAnchor="start">
-              {op.label || 'PORTA'}
-            </text>
-
-            {isSelected && (
-              <rect x={x - 10} y={y - 2} width={w + 20} height={w + 4} fill="none" stroke="#ef4444" strokeWidth="2" strokeDasharray="3 3" />
-            )}
-          </g>
-        );
-      }
-    } else {
-      // Window (Janela)
-      if (op.orientation === 'horizontal') {
-        return (
-          <g key={op.id} onMouseDown={handleOpeningMouseDown} className="cursor-grab active:cursor-grabbing">
-            {/* Window Frame Box matching wall thickness */}
-            <rect x={x} y={y - wallPx / 2} width={w} height={wallPx} fill="white" stroke="#141414" strokeWidth="2" />
-            {/* Double glass panes */}
-            <line x1={x} y1={y - wallPx / 4} x2={x + w} y2={y - wallPx / 4} stroke="#141414" strokeWidth="1" />
-            <line x1={x} y1={y + wallPx / 4} x2={x + w} y2={y + wallPx / 4} stroke="#141414" strokeWidth="1" />
-
-            <text x={x + w / 2} y={y - wallPx / 2 - 4} fill="#141414" fontSize="9" fontWeight="black" textAnchor="middle">
-              {op.label || 'JANELA'}
-            </text>
-
-            {isSelected && (
-              <rect x={x - 2} y={y - wallPx / 2 - 2} width={w + 4} height={wallPx + 4} fill="none" stroke="#ef4444" strokeWidth="2" strokeDasharray="3 3" />
-            )}
-          </g>
-        );
-      } else {
-        // Vertical window
-        return (
-          <g key={op.id} onMouseDown={handleOpeningMouseDown} className="cursor-grab active:cursor-grabbing">
-            <rect x={x - wallPx / 2} y={y} width={wallPx} height={w} fill="white" stroke="#141414" strokeWidth="2" />
-            <line x1={x - wallPx / 4} y1={y} x2={x - wallPx / 4} y2={y + w} stroke="#141414" strokeWidth="1" />
-            <line x1={x + wallPx / 4} y1={y} x2={x + wallPx / 4} y2={y + w} stroke="#141414" strokeWidth="1" />
-
-            <text x={x - wallPx / 2 - 4} y={y + w / 2} fill="#141414" fontSize="9" fontWeight="black" textAnchor="end">
-              {op.label || 'JANELA'}
-            </text>
-
-            {isSelected && (
-              <rect x={x - wallPx / 2 - 2} y={y - 2} width={wallPx + 4} height={w + 4} fill="none" stroke="#ef4444" strokeWidth="2" strokeDasharray="3 3" />
-            )}
-          </g>
-        );
-      }
+          )}
+        </g>
+      );
     }
+
+    return (
+      <g
+        key={op.id}
+        transform={`translate(${x}, ${y}) rotate(${angleDeg})`}
+        onMouseDown={handleOpeningMouseDown}
+        className="cursor-grab active:cursor-grabbing"
+      >
+        {/* Window replaces the wall section instead of being drawn over an uncut wall. */}
+        {cutWall}
+        <line x1="0" y1={-halfWall} x2="0" y2={halfWall} stroke="#141414" strokeWidth="2" />
+        <line x1={w} y1={-halfWall} x2={w} y2={halfWall} stroke="#141414" strokeWidth="2" />
+        <line x1="0" y1={-wallPx / 4} x2={w} y2={-wallPx / 4} stroke="#141414" strokeWidth="1.2" />
+        <line x1="0" y1={wallPx / 4} x2={w} y2={wallPx / 4} stroke="#141414" strokeWidth="1.2" />
+
+        <text
+          x={w / 2}
+          y={-halfWall - 5}
+          fill="#141414"
+          fontSize="9"
+          fontWeight="black"
+          textAnchor="middle"
+        >
+          {op.label || 'JANELA'}
+        </text>
+
+        {isSelected && (
+          <rect
+            x="-3"
+            y={-halfWall - 3}
+            width={w + 6}
+            height={wallPx + 6}
+            fill="none"
+            stroke="#ef4444"
+            strokeWidth="2"
+            strokeDasharray="3 3"
+          />
+        )}
+      </g>
+    );
   };
 
   // Render Electrical Symbols
