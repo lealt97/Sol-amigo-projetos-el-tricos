@@ -3190,30 +3190,21 @@ function distToSegment(
                       connection.side === 'top' || connection.side === 'bottom'
                         ? Math.abs(uy)
                         : Math.abs(ux);
-                    const halfGap = thickPx / (2 * Math.max(0.25, normalComponent)) + 2.5;
+                    const halfGap = thickPx / (2 * Math.max(0.25, normalComponent));
                     const tx = connection.side === 'top' || connection.side === 'bottom' ? 1 : 0;
                     const ty = connection.side === 'left' || connection.side === 'right' ? 1 : 0;
                     const cx = connection.x * scalePxPerMeter;
                     const cy = connection.y * scalePxPerMeter;
 
                     return (
-                      <g key={`room-junction-cut-${w.id}-${endpointKey}`} strokeLinecap="square" pointerEvents="none">
+                      <g key={`room-junction-cut-${w.id}-${endpointKey}`} strokeLinecap="butt" pointerEvents="none">
                         <line
                           x1={cx - tx * halfGap}
                           y1={cy - ty * halfGap}
                           x2={cx + tx * halfGap}
                           y2={cy + ty * halfGap}
                           stroke="#CBD5E1"
-                          strokeWidth="6"
-                        />
-                        <line
-                          x1={cx - tx * halfGap}
-                          y1={cy - ty * halfGap}
-                          x2={cx + tx * halfGap}
-                          y2={cy + ty * halfGap}
-                          stroke="url(#wallMasonryPattern)"
                           strokeWidth="4"
-                          opacity="0.65"
                         />
                       </g>
                     );
