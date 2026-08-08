@@ -30,9 +30,9 @@ jobs:
       - name: Apply sheet viewport refactor
         run: python3 scripts/refactor-fit-sheet-viewport.py
 
-      - name: Inspect generated viewport JSX
+      - name: Normalize generated SVG attribute
         run: |
-          nl -ba src/components/FloorPlanEditor.tsx | sed -n '2298,2330p'
+          sed -i 's/            height="100%$/            height="100%"/' src/components/FloorPlanEditor.tsx
 
       - name: Install dependencies
         run: npm install
