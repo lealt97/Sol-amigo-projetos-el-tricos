@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: agent-scale-denominator-refactor
+  cancel-in-progress: true
+
 jobs:
   refactor-and-validate:
     if: github.actor != 'github-actions[bot]'
