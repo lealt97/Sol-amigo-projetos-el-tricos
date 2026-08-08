@@ -1,0 +1,46 @@
+name: Agent architectural wall junctions
+
+on:
+  push:
+    branches:
+      - agent/architectural-wall-junctions
+
+permissions:
+  contents: write
+
+jobs:
+  refactor-and-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/architectural-wall-junctions
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Apply architectural wall junction refactor
+        run: python scripts/apply_architectural_room_junctions.py
+
+      - name: Install dependencies
+        run: npm install --no-package-lock
+
+      - name: TypeScript validation
+        run: npm run lint
+
+      - name: Production build
+        run: npm run build
+
+      - name: Commit validated changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/components/FloorPlanEditor.tsx
+          if ! git diff --cached --quiet; then
+            git commit -m "fix: criar junções arquitetônicas reais entre paredes e cômodos"
+            git push origin HEAD:agent/architectural-wall-junctions
+          fi
