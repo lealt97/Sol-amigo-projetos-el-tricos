@@ -34,6 +34,14 @@ import {
 } from '../types';
 import { SheetOverlaySVG } from './SheetOverlaySVG';
 import { SheetExportModal } from './SheetExportModal';
+import {
+  DEFAULT_SHEET_SETTINGS,
+  SUPPORTED_DRAWING_SCALES,
+  formatScale,
+  getScalePxPerMeter,
+  getSheetScaleDenominator,
+  isSupportedDrawingScale,
+} from '../utils/nbrSheetEngine';
 
 interface FloorPlanEditorProps {
   projectData: ProjectData;
@@ -71,7 +79,6 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
   onUpdateProjectData,
 }) => {
   // Scale & Viewport State
-  const [scalePxPerMeter, setScalePxPerMeter] = useState<number>(50); // 1 meter = 50px (Scale 1:50)
   const [gridSnapMeters, setGridSnapMeters] = useState<number>(0.25); // 25cm grid snap
   const [zoom, setZoom] = useState<number>(1);
   const [panOffset, setPanOffset] = useState<{ x: number; y: number }>({ x: 40, y: 40 });
@@ -155,22 +162,23 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
   // Sheet Export Modal state
   const [isExportModalOpen, setIsExportModalOpen] = useState(false);
 
-  const currentSheetSettings: SheetSettings = useMemo(() => {
-    return (
-      projectData.sheetSettings || {
-        format: 'A3',
-        orientation: 'landscape',
-        showSheetBorder: true,
-        showTitleBlock: true,
-        sheetTitle: 'PLANTA BAIXA - INSTALAÇÕES ELÉTRICAS NBR 5410',
-        sheetNumber: '01/01',
-        revision: 'R00',
-        sheetScaleText: `1:${Math.round(2500 / scalePxPerMeter)}`,
-        sheetXPosMeters: -0.5,
-        sheetYPosMeters: -0.5,
-      }
-    );
-  }, [projectData.sheetSettings, scalePxPerMeter]);
+  const currentSheetSettings: SheetSettings = useMemo(
+    () => ({
+      ...DEFAULT_SHEET_SETTINGS,
+      ...projectData.sheetSettings,
+    }),
+    [projectData.sheetSettings]
+  );
+
+  const scaleDenominator = useMemo(
+    () => getSheetScaleDenominator(currentSheetSettings, 50),
+    [currentSheetSettings]
+  );
+
+  const scalePxPerMeter = useMemo(
+    () => getScalePxPerMeter(scaleDenominator),
+    [scaleDenominator]
+  );
 
   const canvasRef = useRef<SVGSVGElement>(null);
 
@@ -1481,14 +1489,28 @@ function distToSegment(
             <div className="flex items-center gap-1">
               <span className="font-bold uppercase opacity-80">Escala:</span>
               <select
-                value={scalePxPerMeter}
-                onChange={(e) => setScalePxPerMeter(Number(e.target.value))}
+                value={scaleDenominator}
+                onChange={(e) => {
+                  const nextScale = Number(e.target.value);
+                  onUpdateProjectData({
+                    ...projectData,
+                    sheetSettings: {
+                      ...currentSheetSettings,
+                      scaleDenominator: nextScale,
+                      sheetScaleText: formatScale(nextScale),
+                    },
+                  });
+                }}
                 className="bg-white border border-[#141414] px-2 py-1 text-xs font-bold cursor-pointer"
               >
-                <option value={100}>1:20 (1m = 100px)</option>
-                <option value={50}>1:50 (1m = 50px)</option>
-                <option value={35}>1:75 (1m = 35px)</option>
-                <option value={25}>1:100 (1m = 25px)</option>
+                {!isSupportedDrawingScale(scaleDenominator) && (
+                  <option value={scaleDenominator}>{formatScale(scaleDenominator)} (legado)</option>
+                )}
+                {SUPPORTED_DRAWING_SCALES.map((scale) => (
+                  <option key={scale} value={scale}>
+                    {formatScale(scale)}
+                  </option>
+                ))}
               </select>
             </div>
 
@@ -1866,7 +1888,7 @@ function distToSegment(
                 <line x1="0" y1="0" x2="40" y2="0" stroke="#141414" strokeWidth="2" />
                 <line x1="0" y1="0" x2="0" y2="40" stroke="#141414" strokeWidth="2" />
                 <text x="5" y="15" fontSize="10" fontWeight="bold" fill="#141414">
-                  0,0 m (Escala 1:{Math.round(2500 / scalePxPerMeter)})
+                  0,0 m (Escala {formatScale(scaleDenominator)})
                 </text>
               </g>
 

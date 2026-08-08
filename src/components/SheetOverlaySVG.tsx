@@ -1,6 +1,6 @@
 import React from 'react';
 import { SheetSettings, ProjectSettings } from '../types';
-import { getSheetSpec } from '../utils/nbrSheetEngine';
+import { getSheetScaleDenominator, getSheetSpec } from '../utils/nbrSheetEngine';
 
 interface SheetOverlaySVGProps {
   sheetSettings: SheetSettings;
@@ -20,7 +20,7 @@ export const SheetOverlaySVG: React.FC<SheetOverlaySVGProps> = ({
   const spec = getSheetSpec(sheetSettings.format, sheetSettings.orientation);
 
   // Drawing scale denominator e.g. 50 for 1:50
-  const drawingScaleDenom = Math.round(2500 / scalePxPerMeter);
+  const drawingScaleDenom = getSheetScaleDenominator(sheetSettings, 50);
 
   // Sheet origin in floor plan meters
   const originX = sheetSettings.sheetXPosMeters ?? -0.5;
@@ -90,11 +90,11 @@ export const SheetOverlaySVG: React.FC<SheetOverlaySVGProps> = ({
           fontWeight="bold"
           fontFamily="monospace"
         >
-          📄 FOLHA NORMATIZADA NBR 10068: {spec.name.toUpperCase()}
+          📄 PRANCHA TÉCNICA: {spec.name.toUpperCase()}
         </text>
       </g>
 
-      {/* Inner Margin Border Line (Quadro de Margem NBR 10068 - Thick 0.7mm line) */}
+      {/* Inner Margin Border Line (Quadro interno da prancha) */}
       <rect
         x={innerLeftPx}
         y={innerTopPx}
@@ -105,7 +105,7 @@ export const SheetOverlaySVG: React.FC<SheetOverlaySVGProps> = ({
         strokeWidth="3"
       />
 
-      {/* 25mm Left Margin Binding Band Accent */}
+      {/* Left margin binding band accent */}
       <rect
         x="0"
         y="0"
@@ -115,7 +115,7 @@ export const SheetOverlaySVG: React.FC<SheetOverlaySVGProps> = ({
         fillOpacity="0.03"
       />
 
-      {/* Folding Marks (Marcas de Dobramento NBR 13142) along bottom border */}
+      {/* Folding guide marks along bottom border */}
       {spec.foldMarksMm.map((foldMm, idx) => {
         const foldPx = widthPx - foldMm * paperPxPerMm;
         return (
@@ -132,7 +132,7 @@ export const SheetOverlaySVG: React.FC<SheetOverlaySVGProps> = ({
         );
       })}
 
-      {/* Centering Marks (Marcas de Centro NBR 10068) */}
+      {/* Centering marks */}
       <g stroke="#141414" strokeWidth="2">
         {/* Top Centering Mark */}
         <line x1={widthPx / 2} y1="0" x2={widthPx / 2} y2={topMarginPx + 8} />
@@ -144,9 +144,9 @@ export const SheetOverlaySVG: React.FC<SheetOverlaySVGProps> = ({
         <line x1={widthPx} y1={heightPx / 2} x2={widthPx - rightMarginPx - 8} y2={heightPx / 2} />
       </g>
 
-      {/* TITLE BLOCK / LEGENDA / SELO NBR 10582 (175mm Width) */}
+      {/* TITLE BLOCK / LEGENDA */}
       {sheetSettings.showTitleBlock && (
-        <g transform={`translate(${seloX}, ${seloY})`} id="selo-nbr-10582">
+        <g transform={`translate(${seloX}, ${seloY})`} id="title-block">
           {/* Main Title Block Background */}
           <rect
             x="0"
