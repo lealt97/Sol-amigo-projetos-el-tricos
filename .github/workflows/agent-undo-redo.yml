@@ -1,0 +1,48 @@
+name: Agent CAD undo redo
+
+on:
+  push:
+    branches:
+      - agent/cad-undo-redo
+
+permissions:
+  contents: write
+
+jobs:
+  refactor-and-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/cad-undo-redo
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Apply CAD undo redo
+        run: python3 scripts/apply_cad_undo_redo.py
+
+      - name: Install dependencies
+        run: npm install --no-package-lock
+
+      - name: TypeScript validation
+        run: npm run lint
+
+      - name: Production build
+        run: npm run build
+
+      - name: Commit validated changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/components/FloorPlanEditor.tsx
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "feat: add undo redo history to CAD"
+            git push origin agent/cad-undo-redo
+          fi
