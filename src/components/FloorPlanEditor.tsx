@@ -528,6 +528,57 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
   const floorPlanOpenings = projectData.floorPlan?.openings || [];
   const floorPlanWalls = projectData.floorPlan?.walls || [];
 
+  // A room is stored by its architectural outer rectangle, while the rendered masonry
+  // grows inward. These segments are therefore the real center axes of each room wall.
+  // Custom walls must snap to these axes (not to the outer rectangle) so both faces align.
+  const roomWallAxisSegments = useMemo(() => {
+    const half = wallThicknessMeters / 2;
+
+    return roomsWithGeometry.flatMap((room) => {
+      if (room.x === undefined || room.y === undefined || !room.widthMeters || !room.heightMeters) {
+        return [];
+      }
+
+      const left = room.x;
+      const top = room.y;
+      const right = room.x + room.widthMeters;
+      const bottom = room.y + room.heightMeters;
+      const axisLeft = left + half;
+      const axisRight = right - half;
+      const axisTop = top + half;
+      const axisBottom = bottom - half;
+
+      if (axisRight < axisLeft || axisBottom < axisTop) return [];
+
+      return [
+        {
+          roomId: room.id,
+          side: 'top' as const,
+          start: { x: axisLeft, y: axisTop },
+          end: { x: axisRight, y: axisTop },
+        },
+        {
+          roomId: room.id,
+          side: 'bottom' as const,
+          start: { x: axisLeft, y: axisBottom },
+          end: { x: axisRight, y: axisBottom },
+        },
+        {
+          roomId: room.id,
+          side: 'left' as const,
+          start: { x: axisLeft, y: axisTop },
+          end: { x: axisLeft, y: axisBottom },
+        },
+        {
+          roomId: room.id,
+          side: 'right' as const,
+          start: { x: axisRight, y: axisTop },
+          end: { x: axisRight, y: axisBottom },
+        },
+      ];
+    });
+  }, [roomsWithGeometry, wallThicknessMeters]);
+
   // Snap meters to current grid
   const snap = (meters: number): number => {
     if (gridSnapMeters <= 0) return Math.round(meters * 100) / 100;
@@ -587,53 +638,61 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
 
     const snapRange = 0.35; // 35 cm snap radius
     let minDistance = snapRange;
+    // Compare every candidate against one stable cursor probe. x/y are mutated when
+    // a candidate wins, so reusing them would bias subsequent candidates near corners.
+    const snapProbe = { x, y };
 
-    // 2. Snap to Room Corners and Room Outer Walls
-    for (const r of roomsWithGeometry) {
-      if (r.x === undefined || r.y === undefined || !r.widthMeters || !r.heightMeters) continue;
-      const corners = [
-        { x: r.x, y: r.y },
-        { x: r.x + r.widthMeters, y: r.y },
-        { x: r.x, y: r.y + r.heightMeters },
-        { x: r.x + r.widthMeters, y: r.y + r.heightMeters },
-      ];
+    // 2. Snap to the real center axes of room masonry.
+    // Room coordinates describe the OUTER rectangle, but its wall thickness is rendered
+    // inward. Snapping to the old outer edge caused a half-thickness offset.
+    const projectToSegment = (
+      point: { x: number; y: number },
+      a: { x: number; y: number },
+      b: { x: number; y: number }
+    ) => {
+      const vx = b.x - a.x;
+      const vy = b.y - a.y;
+      const lengthSq = vx * vx + vy * vy;
+      if (lengthSq <= 1e-9) {
+        return { x: a.x, y: a.y, distance: Math.hypot(point.x - a.x, point.y - a.y) };
+      }
+      const t = Math.max(0, Math.min(1, ((point.x - a.x) * vx + (point.y - a.y) * vy) / lengthSq));
+      const projected = { x: a.x + vx * t, y: a.y + vy * t };
+      return {
+        ...projected,
+        distance: Math.hypot(point.x - projected.x, point.y - projected.y),
+      };
+    };
 
-      for (const c of corners) {
-        const d = Math.hypot(x - c.x, y - c.y);
+    // Prefer the center-axis corner when the pointer is near a room corner.
+    for (const segment of roomWallAxisSegments) {
+      for (const corner of [segment.start, segment.end]) {
+        const d = Math.hypot(snapProbe.x - corner.x, snapProbe.y - corner.y);
         if (d < minDistance) {
           minDistance = d;
-          x = c.x;
-          y = c.y;
+          x = corner.x;
+          y = corner.y;
           isSnapped = true;
-          snapInfo = '⚡ Snap ao Canto do Cômodo';
-          snapTargetPoint = { x: c.x, y: c.y };
+          snapInfo = '⚡ Nó central da parede do cômodo';
+          snapTargetPoint = { x: corner.x, y: corner.y };
         }
       }
+    }
 
-      if (!snapTargetPoint) {
-        if (Math.abs(x - r.x) < minDistance) {
-          minDistance = Math.abs(x - r.x);
-          x = r.x;
-          isSnapped = true;
-          snapInfo = '⚡ Snap à Parede Esquerda';
-        } else if (Math.abs(x - (r.x + r.widthMeters)) < minDistance) {
-          minDistance = Math.abs(x - (r.x + r.widthMeters));
-          x = r.x + r.widthMeters;
-          isSnapped = true;
-          snapInfo = '⚡ Snap à Parede Direita';
-        }
-
-        if (Math.abs(y - r.y) < minDistance) {
-          minDistance = Math.abs(y - r.y);
-          y = r.y;
-          isSnapped = true;
-          snapInfo = '⚡ Snap à Parede Superior';
-        } else if (Math.abs(y - (r.y + r.heightMeters)) < minDistance) {
-          minDistance = Math.abs(y - (r.y + r.heightMeters));
-          y = r.y + r.heightMeters;
-          isSnapped = true;
-          snapInfo = '⚡ Snap à Parede Inferior';
-        }
+    // Then project exactly onto the nearest wall center axis, including the middle of a side.
+    for (const segment of roomWallAxisSegments) {
+      const projection = projectToSegment(
+        snapProbe,
+        segment.start,
+        segment.end
+      );
+      if (projection.distance < minDistance) {
+        minDistance = projection.distance;
+        x = projection.x;
+        y = projection.y;
+        isSnapped = true;
+        snapInfo = `⚡ Eixo da parede do cômodo (${segment.side})`;
+        snapTargetPoint = { x: projection.x, y: projection.y };
       }
     }
 
@@ -646,7 +705,7 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
       ];
 
       for (const ep of endpoints) {
-        const d = Math.hypot(x - ep.x, y - ep.y);
+        const d = Math.hypot(snapProbe.x - ep.x, snapProbe.y - ep.y);
         if (d < minDistance) {
           minDistance = d;
           x = ep.x;
@@ -658,12 +717,12 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
       }
 
       if (!snapTargetPoint) {
-        if (w.x1Meters === w.x2Meters && Math.abs(x - w.x1Meters) < minDistance) {
+        if (w.x1Meters === w.x2Meters && Math.abs(snapProbe.x - w.x1Meters) < minDistance) {
           x = w.x1Meters;
           isSnapped = true;
           snapInfo = '⚡ Alinhado a Parede Vertical';
         }
-        if (w.y1Meters === w.y2Meters && Math.abs(y - w.y1Meters) < minDistance) {
+        if (w.y1Meters === w.y2Meters && Math.abs(snapProbe.y - w.y1Meters) < minDistance) {
           y = w.y1Meters;
           isSnapped = true;
           snapInfo = '⚡ Alinhado a Parede Horizontal';
@@ -2223,22 +2282,16 @@ function distToSegment(
       });
       if (touchesCustomWall) return true;
 
-      return roomsWithGeometry.some((room) => {
-        const left = room.x ?? 0;
-        const top = room.y ?? 0;
-        const right = left + (room.widthMeters ?? 0);
-        const bottom = top + (room.heightMeters ?? 0);
-
-        const withinX = point.x >= left - tolerance && point.x <= right + tolerance;
-        const withinY = point.y >= top - tolerance && point.y <= bottom + tolerance;
-
-        return (
-          (withinX && (Math.abs(point.y - top) <= tolerance || Math.abs(point.y - bottom) <= tolerance)) ||
-          (withinY && (Math.abs(point.x - left) <= tolerance || Math.abs(point.x - right) <= tolerance))
-        );
-      });
+      return roomWallAxisSegments.some(
+        (segment) =>
+          distanceToSegment(
+            point,
+            segment.start,
+            segment.end
+          ) <= tolerance
+      );
     },
-    [floorPlanWalls, roomsWithGeometry, gridSnapMeters]
+    [floorPlanWalls, roomWallAxisSegments, gridSnapMeters]
   );
 
   // Render Conduit Lines
@@ -2971,6 +3024,52 @@ function distToSegment(
                   );
                 })}
 
+                {/* Merge a custom wall into room/custom masonry before drawing its technical faces.
+                    This overlay hides the host-wall seam inside a true junction while preserving
+                    the same masonry fill/hatch, so L/T connections read as one continuous wall. */}
+                {floorPlanWalls.map((w) => {
+                  const startConnected = isWallEndpointConnected(w, {
+                    x: w.x1Meters,
+                    y: w.y1Meters,
+                  });
+                  const endConnected = isWallEndpointConnected(w, {
+                    x: w.x2Meters,
+                    y: w.y2Meters,
+                  });
+                  if (!startConnected && !endConnected) return null;
+
+                  const x1 = w.x1Meters * scalePxPerMeter;
+                  const y1 = w.y1Meters * scalePxPerMeter;
+                  const x2 = w.x2Meters * scalePxPerMeter;
+                  const y2 = w.y2Meters * scalePxPerMeter;
+                  const thick = (w.thicknessMeters || wallThicknessMeters) * scalePxPerMeter;
+                  const dx = x2 - x1;
+                  const dy = y2 - y1;
+                  const lengthPx = Math.hypot(dx, dy);
+                  if (lengthPx < 0.1) return null;
+
+                  const ux = dx / lengthPx;
+                  const uy = dy / lengthPx;
+                  const nx = -uy;
+                  const ny = ux;
+                  const h = thick / 2;
+                  const startExtension = startConnected ? h + 1 : 0;
+                  const endExtension = endConnected ? h + 1 : 0;
+
+                  const p1 = { x: x1 - ux * startExtension + nx * h, y: y1 - uy * startExtension + ny * h };
+                  const p2 = { x: x2 + ux * endExtension + nx * h, y: y2 + uy * endExtension + ny * h };
+                  const p3 = { x: x2 + ux * endExtension - nx * h, y: y2 + uy * endExtension - ny * h };
+                  const p4 = { x: x1 - ux * startExtension - nx * h, y: y1 - uy * startExtension - ny * h };
+                  const d = `M ${p1.x} ${p1.y} L ${p2.x} ${p2.y} L ${p3.x} ${p3.y} L ${p4.x} ${p4.y} Z`;
+
+                  return (
+                    <g key={`junction-fill-${w.id}`} stroke="none">
+                      <path d={d} fill="#CBD5E1" />
+                      <path d={d} fill="url(#wallMasonryPattern)" opacity="0.65" />
+                    </g>
+                  );
+                })}
+
                 {/* Custom walls always draw both faces. End caps disappear only at real wall connections. */}
                 {floorPlanWalls.map((w) => {
                   const x1 = w.x1Meters * scalePxPerMeter;
@@ -2992,11 +3091,6 @@ function distToSegment(
                   const ny = ux;
                   const h = thick / 2;
 
-                  const p1 = { x: x1 + nx * h, y: y1 + ny * h };
-                  const p2 = { x: x2 + nx * h, y: y2 + ny * h };
-                  const p3 = { x: x2 - nx * h, y: y2 - ny * h };
-                  const p4 = { x: x1 - nx * h, y: y1 - ny * h };
-
                   const startConnected = isWallEndpointConnected(w, {
                     x: w.x1Meters,
                     y: w.y1Meters,
@@ -3005,6 +3099,15 @@ function distToSegment(
                     x: w.x2Meters,
                     y: w.y2Meters,
                   });
+
+                  // Connected faces run through the host wall centerline up to its far face.
+                  // This removes the small visual notch that remained even after snapping axes.
+                  const startExtension = startConnected ? h : 0;
+                  const endExtension = endConnected ? h : 0;
+                  const p1 = { x: x1 - ux * startExtension + nx * h, y: y1 - uy * startExtension + ny * h };
+                  const p2 = { x: x2 + ux * endExtension + nx * h, y: y2 + uy * endExtension + ny * h };
+                  const p3 = { x: x2 + ux * endExtension - nx * h, y: y2 + uy * endExtension - ny * h };
+                  const p4 = { x: x1 - ux * startExtension - nx * h, y: y1 - uy * startExtension - ny * h };
 
                   return (
                     <g key={`outline-wall-${w.id}`} strokeWidth={strokeWidth} strokeLinecap="square">
