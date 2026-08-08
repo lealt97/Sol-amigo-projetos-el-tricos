@@ -115,7 +115,7 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
   projectData,
   sizedCircuits,
   onUpdateRooms,
-  onUpdateProjectData,
+  onUpdateProjectData: commitProjectData,
 }) => {
   // Scale & Viewport State
   const [gridSnapMeters, setGridSnapMeters] = useState<number>(0.25); // 25cm grid snap
@@ -224,6 +224,74 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
 
   const canvasRef = useRef<SVGSVGElement>(null);
   const canvasViewportRef = useRef<HTMLDivElement>(null);
+
+  // CAD action history. Project snapshots are intentionally stored in refs so
+  // transient pointer movement does not trigger extra renders.
+  const undoStackRef = useRef<ProjectData[]>([]);
+  const redoStackRef = useRef<ProjectData[]>([]);
+  const historyTransactionRef = useRef<ProjectData | null>(null);
+  const historyTransactionDirtyRef = useRef(false);
+  const HISTORY_LIMIT = 100;
+
+  const cloneProjectSnapshot = (data: ProjectData): ProjectData =>
+    JSON.parse(JSON.stringify(data)) as ProjectData;
+
+  const snapshotsMatch = (a: ProjectData, b: ProjectData) =>
+    JSON.stringify(a) === JSON.stringify(b);
+
+  const pushUndoSnapshot = (snapshot: ProjectData) => {
+    const stack = undoStackRef.current;
+    const last = stack[stack.length - 1];
+    if (last && snapshotsMatch(last, snapshot)) return;
+    undoStackRef.current = [...stack, cloneProjectSnapshot(snapshot)].slice(-HISTORY_LIMIT);
+  };
+
+  const beginHistoryTransaction = () => {
+    if (historyTransactionRef.current) return;
+    historyTransactionRef.current = cloneProjectSnapshot(projectData);
+    historyTransactionDirtyRef.current = false;
+  };
+
+  const finishHistoryTransaction = () => {
+    const snapshot = historyTransactionRef.current;
+    if (snapshot && historyTransactionDirtyRef.current) {
+      pushUndoSnapshot(snapshot);
+    }
+    historyTransactionRef.current = null;
+    historyTransactionDirtyRef.current = false;
+  };
+
+  const rollbackHistoryTransaction = () => {
+    const snapshot = historyTransactionRef.current;
+    const wasDirty = historyTransactionDirtyRef.current;
+    historyTransactionRef.current = null;
+    historyTransactionDirtyRef.current = false;
+    if (snapshot && wasDirty) {
+      commitProjectData(cloneProjectSnapshot(snapshot));
+    }
+  };
+
+  // Existing mutations continue calling onUpdateProjectData, but now each
+  // atomic command records one undo point. Continuous drags are grouped by the
+  // transaction helpers and therefore become a single Ctrl+Z action.
+  const onUpdateProjectData = (nextData: ProjectData) => {
+    if (snapshotsMatch(projectData, nextData)) {
+      commitProjectData(nextData);
+      return;
+    }
+
+    if (historyTransactionRef.current) {
+      historyTransactionDirtyRef.current = true;
+      redoStackRef.current = [];
+      commitProjectData(nextData);
+      return;
+    }
+
+    pushUndoSnapshot(projectData);
+    redoStackRef.current = [];
+    commitProjectData(nextData);
+  };
+
 
   const fitSheetToViewport = useCallback((announce = false) => {
     const viewport = canvasViewportRef.current;
@@ -350,6 +418,7 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
   };
 
   const activateTool = (tool: ToolMode) => {
+    rollbackHistoryTransaction();
     resetTransientGesture();
     if (tool !== 'add_conduit') setConduitFromId(null);
     if (tool !== 'measure') {
@@ -361,6 +430,7 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
   };
 
   const cancelCurrentOperation = () => {
+    rollbackHistoryTransaction();
     resetTransientGesture();
     setConduitFromId(null);
     setMeasureStart(null);
@@ -373,7 +443,51 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
     if (isDrawingRoom || isDrawingWall || isMeasuring) {
       setToolStatus('Gesto cancelado porque o cursor saiu da área de desenho.');
     }
+    rollbackHistoryTransaction();
     resetTransientGesture();
+  };
+
+  const undoProjectAction = () => {
+    if (historyTransactionRef.current) {
+      rollbackHistoryTransaction();
+      resetTransientGesture();
+      clearSelections();
+      setToolStatus('Ação atual cancelada e restaurada.');
+      return;
+    }
+
+    const previous = undoStackRef.current[undoStackRef.current.length - 1];
+    if (!previous) {
+      setToolStatus('Nada para desfazer.');
+      return;
+    }
+
+    undoStackRef.current = undoStackRef.current.slice(0, -1);
+    redoStackRef.current = [...redoStackRef.current, cloneProjectSnapshot(projectData)].slice(-HISTORY_LIMIT);
+    commitProjectData(cloneProjectSnapshot(previous));
+    resetTransientGesture();
+    clearSelections();
+    setToolStatus('Ação desfeita • Ctrl/Cmd + Z');
+  };
+
+  const redoProjectAction = () => {
+    if (historyTransactionRef.current) {
+      setToolStatus('Finalize ou cancele a ação atual antes de refazer.');
+      return;
+    }
+
+    const next = redoStackRef.current[redoStackRef.current.length - 1];
+    if (!next) {
+      setToolStatus('Nada para refazer.');
+      return;
+    }
+
+    redoStackRef.current = redoStackRef.current.slice(0, -1);
+    pushUndoSnapshot(projectData);
+    commitProjectData(cloneProjectSnapshot(next));
+    resetTransientGesture();
+    clearSelections();
+    setToolStatus('Ação refeita • Ctrl/Cmd + Shift + Z / Ctrl + Y');
   };
 
   // Ensure rooms have geometry coordinates in meters
@@ -775,6 +889,8 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
       return;
     }
 
+    beginHistoryTransaction();
+
     if (kind === 'room') {
       const room = roomsWithGeometry.find((item) => item.id === id);
       if (!room) return;
@@ -840,10 +956,12 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
         setSelectedWallIds([]);
       }
     } else if (activeTool === 'draw_room') {
+      beginHistoryTransaction();
       setIsDrawingRoom(true);
       setDragStartPos(coords);
       setDragCurrentPos(coords);
     } else if (activeTool === 'draw_wall') {
+      beginHistoryTransaction();
       const snap = getSmartWallCoords(coords, null, e.shiftKey);
       setIsDrawingWall(true);
       setWallStartPos({ x: snap.x, y: snap.y });
@@ -1223,6 +1341,7 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
 
   const handleMouseUp = () => {
     if (elementDrag) {
+      finishHistoryTransaction();
       const movedLabel =
         elementDrag.kind === 'room'
           ? 'Cômodo reposicionado.'
@@ -1242,6 +1361,7 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
     }
 
     if (draggingWallHandle) {
+      finishHistoryTransaction();
       setDraggingWallHandle(null);
       return;
     }
@@ -1288,6 +1408,7 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
         });
       }
 
+      finishHistoryTransaction();
       setIsDrawingWall(false);
       setWallStartPos(null);
       setWallCurrentPos(null);
@@ -1357,6 +1478,7 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
         },
       });
 
+      finishHistoryTransaction();
       setIsDrawingRoom(false);
       setDragStartPos(null);
       setDragCurrentPos(null);
@@ -1519,6 +1641,22 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
       }
 
       if (isTyping) return;
+
+      const hasHistoryModifier = (e.ctrlKey || e.metaKey) && !e.altKey;
+      if (hasHistoryModifier) {
+        const key = e.key.toLowerCase();
+        if (key === 'z') {
+          e.preventDefault();
+          if (e.shiftKey) redoProjectAction();
+          else undoProjectAction();
+          return;
+        }
+        if (key === 'y' && !e.shiftKey) {
+          e.preventDefault();
+          redoProjectAction();
+          return;
+        }
+      }
 
       if (e.code === 'Space') {
         e.preventDefault();
@@ -3033,6 +3171,7 @@ function distToSegment(
                           className="cursor-crosshair hover:scale-125 transition-transform"
                           onMouseDown={(e) => {
                             e.stopPropagation();
+                            beginHistoryTransaction();
                             setDraggingWallHandle({ wallId: w.id, handle: 'p1' });
                           }}
                         />
@@ -3046,6 +3185,7 @@ function distToSegment(
                           className="cursor-crosshair hover:scale-125 transition-transform"
                           onMouseDown={(e) => {
                             e.stopPropagation();
+                            beginHistoryTransaction();
                             setDraggingWallHandle({ wallId: w.id, handle: 'p2' });
                           }}
                         />
