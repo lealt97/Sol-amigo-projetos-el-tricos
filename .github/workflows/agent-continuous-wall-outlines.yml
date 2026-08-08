@@ -1,0 +1,53 @@
+name: Agent continuous wall outlines
+
+on:
+  push:
+    branches:
+      - agent/continuous-wall-outlines
+
+permissions:
+  contents: write
+
+concurrency:
+  group: agent-continuous-wall-outlines
+  cancel-in-progress: true
+
+jobs:
+  refactor-and-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/continuous-wall-outlines
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Apply continuous wall outline fix
+        run: python3 scripts/fix-continuous-wall-outlines.py
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: TypeScript validation
+        run: npm run lint
+
+      - name: Production build
+        run: npm run build
+
+      - name: Commit validated changes
+        run: |
+          rm -f scripts/fix-continuous-wall-outlines.py .github/workflows/agent-continuous-wall-outlines.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git commit -m "fix: keep wall outlines continuous"
+          git push origin HEAD:agent/continuous-wall-outlines
