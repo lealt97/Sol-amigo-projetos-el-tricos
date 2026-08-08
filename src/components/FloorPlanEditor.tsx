@@ -638,6 +638,9 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
 
     const snapRange = 0.35; // 35 cm snap radius
     let minDistance = snapRange;
+    // Compare every candidate against one stable cursor probe. x/y are mutated when
+    // a candidate wins, so reusing them would bias subsequent candidates near corners.
+    const snapProbe = { x, y };
 
     // 2. Snap to the real center axes of room masonry.
     // Room coordinates describe the OUTER rectangle, but its wall thickness is rendered
@@ -664,7 +667,7 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
     // Prefer the center-axis corner when the pointer is near a room corner.
     for (const segment of roomWallAxisSegments) {
       for (const corner of [segment.start, segment.end]) {
-        const d = Math.hypot(x - corner.x, y - corner.y);
+        const d = Math.hypot(snapProbe.x - corner.x, snapProbe.y - corner.y);
         if (d < minDistance) {
           minDistance = d;
           x = corner.x;
@@ -679,7 +682,7 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
     // Then project exactly onto the nearest wall center axis, including the middle of a side.
     for (const segment of roomWallAxisSegments) {
       const projection = projectToSegment(
-        { x, y },
+        snapProbe,
         segment.start,
         segment.end
       );
@@ -702,7 +705,7 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
       ];
 
       for (const ep of endpoints) {
-        const d = Math.hypot(x - ep.x, y - ep.y);
+        const d = Math.hypot(snapProbe.x - ep.x, snapProbe.y - ep.y);
         if (d < minDistance) {
           minDistance = d;
           x = ep.x;
@@ -714,12 +717,12 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
       }
 
       if (!snapTargetPoint) {
-        if (w.x1Meters === w.x2Meters && Math.abs(x - w.x1Meters) < minDistance) {
+        if (w.x1Meters === w.x2Meters && Math.abs(snapProbe.x - w.x1Meters) < minDistance) {
           x = w.x1Meters;
           isSnapped = true;
           snapInfo = '⚡ Alinhado a Parede Vertical';
         }
-        if (w.y1Meters === w.y2Meters && Math.abs(y - w.y1Meters) < minDistance) {
+        if (w.y1Meters === w.y2Meters && Math.abs(snapProbe.y - w.y1Meters) < minDistance) {
           y = w.y1Meters;
           isSnapped = true;
           snapInfo = '⚡ Alinhado a Parede Horizontal';
