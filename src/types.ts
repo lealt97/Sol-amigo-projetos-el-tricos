@@ -158,6 +158,7 @@ export interface SheetSettings {
   sheetTitle: string; // e.g. "PLANTA BAIXA - INSTALAÇÕES ELÉTRICAS NBR 5410"
   sheetNumber: string; // e.g. "01/01"
   revision: string; // e.g. "R00"
+  scaleDenominator?: number; // fonte de verdade da escala técnica: 50 => 1:50
   sheetScaleText?: string; // e.g. "1:50" or "INDICADA"
   sheetXPosMeters?: number; // Position offset of the sheet frame on the floor plan
   sheetYPosMeters?: number;
