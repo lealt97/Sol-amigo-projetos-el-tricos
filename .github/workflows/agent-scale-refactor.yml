@@ -1,0 +1,182 @@
+name: Agent scale refactor
+
+on:
+  push:
+    branches:
+      - agent/scale-denominator-refactor
+
+permissions:
+  contents: write
+
+jobs:
+  refactor-and-validate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v6
+        with:
+          ref: agent/scale-denominator-refactor
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Refactor scale source of truth
+        shell: bash
+        run: |
+          python <<'PY'
+          from pathlib import Path
+          import re
+
+          def replace_once(text: str, old: str, new: str, label: str) -> str:
+              if text.count(old) != 1:
+                  raise SystemExit(f'{label}: expected exactly one match, found {text.count(old)}')
+              return text.replace(old, new, 1)
+
+          editor_path = Path('src/components/FloorPlanEditor.tsx')
+          text = editor_path.read_text(encoding='utf-8')
+
+          text = replace_once(
+              text,
+              "import { SheetExportModal } from './SheetExportModal';\n",
+              "import { SheetExportModal } from './SheetExportModal';\nimport {\n  DEFAULT_SHEET_SETTINGS,\n  SUPPORTED_DRAWING_SCALES,\n  formatScale,\n  getScalePxPerMeter,\n  getSheetScaleDenominator,\n  isSupportedDrawingScale,\n} from '../utils/nbrSheetEngine';\n",
+              'engine import',
+          )
+
+          text = replace_once(
+              text,
+              "  const [scalePxPerMeter, setScalePxPerMeter] = useState<number>(50); // 1 meter = 50px (Scale 1:50)\n",
+              "",
+              'legacy scale state',
+          )
+
+          settings_pattern = re.compile(
+              r"  const currentSheetSettings: SheetSettings = useMemo\(\(\) => \{\n.*?\n  \}, \[projectData\.sheetSettings, scalePxPerMeter\]\);",
+              re.S,
+          )
+          settings_replacement = """  const currentSheetSettings: SheetSettings = useMemo(
+    () => ({
+      ...DEFAULT_SHEET_SETTINGS,
+      ...projectData.sheetSettings,
+    }),
+    [projectData.sheetSettings]
+  );
+
+  const scaleDenominator = useMemo(
+    () => getSheetScaleDenominator(currentSheetSettings, 50),
+    [currentSheetSettings]
+  );
+
+  const scalePxPerMeter = useMemo(
+    () => getScalePxPerMeter(scaleDenominator),
+    [scaleDenominator]
+  );"""
+          text, count = settings_pattern.subn(settings_replacement, text, count=1)
+          if count != 1:
+              raise SystemExit(f'currentSheetSettings block: expected one match, found {count}')
+
+          old_selector = """              <select
+                value={scalePxPerMeter}
+                onChange={(e) => setScalePxPerMeter(Number(e.target.value))}
+                className=\"bg-white border border-[#141414] px-2 py-1 text-xs font-bold cursor-pointer\"
+              >
+                <option value={100}>1:20 (1m = 100px)</option>
+                <option value={50}>1:50 (1m = 50px)</option>
+                <option value={35}>1:75 (1m = 35px)</option>
+                <option value={25}>1:100 (1m = 25px)</option>
+              </select>"""
+          new_selector = """              <select
+                value={scaleDenominator}
+                onChange={(e) => {
+                  const nextScale = Number(e.target.value);
+                  onUpdateProjectData({
+                    ...projectData,
+                    sheetSettings: {
+                      ...currentSheetSettings,
+                      scaleDenominator: nextScale,
+                      sheetScaleText: formatScale(nextScale),
+                    },
+                  });
+                }}
+                className=\"bg-white border border-[#141414] px-2 py-1 text-xs font-bold cursor-pointer\"
+              >
+                {!isSupportedDrawingScale(scaleDenominator) && (
+                  <option value={scaleDenominator}>{formatScale(scaleDenominator)} (legado)</option>
+                )}
+                {SUPPORTED_DRAWING_SCALES.map((scale) => (
+                  <option key={scale} value={scale}>
+                    {formatScale(scale)}
+                  </option>
+                ))}
+              </select>"""
+          text = replace_once(text, old_selector, new_selector, 'scale selector')
+
+          text = replace_once(
+              text,
+              "0,0 m (Escala 1:{Math.round(2500 / scalePxPerMeter)})",
+              "0,0 m (Escala {formatScale(scaleDenominator)})",
+              'origin scale label',
+          )
+
+          editor_path.write_text(text, encoding='utf-8')
+
+          overlay_path = Path('src/components/SheetOverlaySVG.tsx')
+          overlay = overlay_path.read_text(encoding='utf-8')
+          overlay = replace_once(
+              overlay,
+              "import { getSheetSpec } from '../utils/nbrSheetEngine';",
+              "import { getSheetScaleDenominator, getSheetSpec } from '../utils/nbrSheetEngine';",
+              'overlay engine import',
+          )
+          overlay = replace_once(
+              overlay,
+              "  const drawingScaleDenom = Math.round(2500 / scalePxPerMeter);",
+              "  const drawingScaleDenom = getSheetScaleDenominator(sheetSettings, 50);",
+              'overlay scale denominator',
+          )
+          overlay = overlay.replace('📄 FOLHA NORMATIZADA NBR 10068:', '📄 PRANCHA TÉCNICA:')
+          overlay = overlay.replace('Quadro de Margem NBR 10068 - Thick 0.7mm line', 'Quadro interno da prancha')
+          overlay = overlay.replace('25mm Left Margin Binding Band Accent', 'Left margin binding band accent')
+          overlay = overlay.replace('Folding Marks (Marcas de Dobramento NBR 13142)', 'Folding guide marks')
+          overlay = overlay.replace('Centering Marks (Marcas de Centro NBR 10068)', 'Centering marks')
+          overlay = overlay.replace('TITLE BLOCK / LEGENDA / SELO NBR 10582 (175mm Width)', 'TITLE BLOCK / LEGENDA')
+          overlay = overlay.replace('id="selo-nbr-10582"', 'id="title-block"')
+          overlay_path.write_text(overlay, encoding='utf-8')
+
+          modal_path = Path('src/components/SheetExportModal.tsx')
+          modal = modal_path.read_text(encoding='utf-8')
+          modal = modal.replace('NBR 10068 / NBR 10582', 'PRANCHA TÉCNICA')
+          modal = modal.replace('1. Formato da Folha (NBR 10068)', '1. Formato da Folha')
+          modal = modal.replace('2. Dados da Legenda / Selo (NBR 10582)', '2. Dados da Legenda / Selo')
+          modal = modal.replace('• Margem Esquerda: <strong className="text-[#141414]">25 mm</strong> (Encadernação)', '• Margem Esquerda: <strong className="text-[#141414]">{spec.leftMarginMm} mm</strong>')
+          modal = modal.replace('• Largura Padrão da Legenda/Selo:{\' \'}\n                  <strong className="text-[#141414]">175 mm</strong> (NBR 10582)', '• Largura da Legenda/Selo:{\' \'}\n                  <strong className="text-[#141414]">{spec.titleBlockWidthMm} mm</strong>')
+          modal = modal.replace('25mm Encadernação', '{spec.leftMarginMm}mm margem esquerda')
+          modal = modal.replace('Simbologia NBR 5444', 'Simbologia elétrica')
+          modal = modal.replace('Title Block (Legenda / Selo 175mm)', 'Title Block (Legenda / Selo)')
+          old_note = '<strong>Emissão em conformidade com as normas ABNT:</strong> NBR 10068 (Leiaute e dimensões de folhas), NBR 10582 (Apresentação e Legenda/Selo de 175mm) e NBR 13142 (Dobramento).'
+          new_note = '<strong>Prancha técnica:</strong> dimensões, margens, escala e legenda são controladas pelo motor físico do Sol Amigo.'
+          modal = replace_once(modal, old_note, new_note, 'modal technical note')
+          modal_path.write_text(modal, encoding='utf-8')
+          PY
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: TypeScript validation
+        run: npm run lint
+
+      - name: Production build
+        run: npm run build
+
+      - name: Commit validated refactor
+        shell: bash
+        run: |
+          rm .github/workflows/agent-scale-refactor.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/components/FloorPlanEditor.tsx src/components/SheetOverlaySVG.tsx src/components/SheetExportModal.tsx .github/workflows/agent-scale-refactor.yml
+          git commit -m "refactor: separate technical scale from viewport"
+          git push origin HEAD:agent/scale-denominator-refactor
