@@ -13,7 +13,14 @@ import {
   RotateCcw,
 } from 'lucide-react';
 import { PaperFormat, PaperOrientation, SheetSettings, ProjectData, Room } from '../types';
-import { getSheetSpec, PAPER_SPECS_NBR } from '../utils/nbrSheetEngine';
+import {
+  DEFAULT_SHEET_SETTINGS,
+  SUPPORTED_DRAWING_SCALES,
+  formatScale,
+  getSheetScaleDenominator,
+  getSheetSpec,
+  PAPER_SPECS_NBR,
+} from '../utils/nbrSheetEngine';
 
 interface SheetExportModalProps {
   isOpen: boolean;
@@ -31,17 +38,9 @@ export const SheetExportModal: React.FC<SheetExportModalProps> = ({
   onUpdateSheetSettings,
   onUpdateProjectSettings,
 }) => {
-  if (!isOpen) return null;
-
-  const currentSheet = projectData.sheetSettings || {
-    format: 'A3' as PaperFormat,
-    orientation: 'landscape' as PaperOrientation,
-    showSheetBorder: true,
-    showTitleBlock: true,
-    sheetTitle: 'PLANTA BAIXA - INSTALAÇÕES ELÉTRICAS NBR 5410',
-    sheetNumber: '01/01',
-    revision: 'R00',
-    sheetScaleText: '1:50',
+  const currentSheet: SheetSettings = {
+    ...DEFAULT_SHEET_SETTINGS,
+    ...projectData.sheetSettings,
   };
 
   const currentProject = projectData.settings;
@@ -53,7 +52,9 @@ export const SheetExportModal: React.FC<SheetExportModalProps> = ({
   const [sheetTitle, setSheetTitle] = useState<string>(currentSheet.sheetTitle || 'PLANTA BAIXA - ARQUITETÔNICO E ILUMINAÇÃO');
   const [sheetNumber, setSheetNumber] = useState<string>(currentSheet.sheetNumber || '01/01');
   const [revision, setRevision] = useState<string>(currentSheet.revision || 'R00');
-  const [sheetScaleText, setSheetScaleText] = useState<string>(currentSheet.sheetScaleText || '1:50');
+  const [scaleDenominator, setScaleDenominator] = useState<number>(
+    getSheetScaleDenominator(currentSheet, 50)
+  );
 
   // Project Settings form fields
   const [projectName, setProjectName] = useState<string>(currentProject.projectName || 'PROJETO ELÉTRICO RESIDENCIAL');
@@ -64,6 +65,7 @@ export const SheetExportModal: React.FC<SheetExportModalProps> = ({
   const [artNumber, setArtNumber] = useState<string>(currentProject.artNumber || '987654321');
 
   const spec = getSheetSpec(format, orientation);
+  const scaleText = formatScale(scaleDenominator);
 
   const handleApplyAndSave = () => {
     const updatedSheet: SheetSettings = {
@@ -74,7 +76,8 @@ export const SheetExportModal: React.FC<SheetExportModalProps> = ({
       sheetTitle,
       sheetNumber,
       revision,
-      sheetScaleText,
+      scaleDenominator,
+      sheetScaleText: scaleText,
     };
 
     const updatedProject = {
@@ -98,6 +101,9 @@ export const SheetExportModal: React.FC<SheetExportModalProps> = ({
       window.print();
     }, 300);
   };
+
+  // Keep hooks unconditional so opening/closing the modal never changes hook order.
+  if (!isOpen) return null;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-[#141414]/80 p-4 overflow-y-auto backdrop-blur-sm animate-fade-in font-sans">
@@ -291,12 +297,17 @@ export const SheetExportModal: React.FC<SheetExportModalProps> = ({
                   <div className="grid grid-cols-3 gap-2">
                     <div>
                       <label className="block font-bold mb-0.5">Escala:</label>
-                      <input
-                        type="text"
-                        value={sheetScaleText}
-                        onChange={(e) => setSheetScaleText(e.target.value)}
+                      <select
+                        value={scaleDenominator}
+                        onChange={(e) => setScaleDenominator(Number(e.target.value))}
                         className="w-full bg-[#E4E3E0]/30 border border-[#141414] p-1.5 text-center font-bold"
-                      />
+                      >
+                        {SUPPORTED_DRAWING_SCALES.map((scale) => (
+                          <option key={scale} value={scale}>
+                            {formatScale(scale)}
+                          </option>
+                        ))}
+                      </select>
                     </div>
 
                     <div>
@@ -360,7 +371,7 @@ export const SheetExportModal: React.FC<SheetExportModalProps> = ({
                       [ PLANTA BAIXA ARQUITETÔNICA E ELÉTRICA ]
                     </div>
                     <div className="text-[10px] font-mono text-zinc-500 mt-1">
-                      {projectData.rooms.length} cômodos | Escala {sheetScaleText} | Simbologia NBR 5444
+                      {projectData.rooms.length} cômodos | Escala {scaleText} | Simbologia NBR 5444
                     </div>
                   </div>
 
@@ -390,7 +401,7 @@ export const SheetExportModal: React.FC<SheetExportModalProps> = ({
                         </div>
                       </div>
                       <div className="p-1 bg-zinc-100 flex justify-between font-mono font-bold text-[7.5px]">
-                        <span>ESC: {sheetScaleText}</span>
+                        <span>ESC: {scaleText}</span>
                         <span>PRANCHA: {sheetNumber}</span>
                         <span>FORMATO: {format}</span>
                         <span>REV: {revision}</span>
