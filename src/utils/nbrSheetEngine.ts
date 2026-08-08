@@ -131,6 +131,7 @@ export const DEFAULT_SHEET_SETTINGS: SheetSettings = {
   sheetTitle: 'PLANTA BAIXA - INSTALAÇÕES ELÉTRICAS NBR 5410',
   sheetNumber: '01/01',
   revision: 'R00',
+  scaleDenominator: 50,
   sheetScaleText: '1:50',
   sheetXPosMeters: -0.5,
   sheetYPosMeters: -0.5,
@@ -237,6 +238,12 @@ export function parseScaleDenominator(scaleText?: string | null): number | null 
 }
 
 export function getSheetScaleDenominator(settings: SheetSettings, fallback = 50): number {
+  const numericScale = settings.scaleDenominator;
+
+  if (Number.isFinite(numericScale) && (numericScale as number) > 0) {
+    return numericScale as number;
+  }
+
   return parseScaleDenominator(settings.sheetScaleText) ?? fallback;
 }
 
