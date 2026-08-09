@@ -1138,3 +1138,62 @@ export const findClosedWallFaces = (
     return a.id.localeCompare(b.id);
   });
 };
+
+
+/**
+ * Converts legacy custom-wall contacts stored on a host's physical face into one
+ * canonical centerline topology. Rendering owns thickness/face trims; persisted wall
+ * geometry owns only logical axes and nodes.
+ *
+ * This is intentionally iterative because migrating one endpoint can expose a second
+ * exact connection in the same network. The operation is deterministic and idempotent.
+ */
+export const canonicalizeWallCenterlineTopology = (
+  walls: FloorPlanWall[],
+  options: WallGraphOptions = {}
+): FloorPlanWall[] => {
+  const nodeToleranceMeters = options.nodeToleranceMeters ?? CAD_NODE_TOLERANCE_M;
+  let current = walls.map((wall) => ({ ...wall }));
+
+  for (let pass = 0; pass < 4; pass += 1) {
+    const graph = buildWallGraph(current, options);
+    const endpointTargets = new Map<string, CadPoint>();
+
+    for (const node of graph.nodes) {
+      if (node.wallIds.length < 2) continue;
+      for (const branch of node.branches) {
+        if (branch.role !== 'start' && branch.role !== 'end') continue;
+        const key = `${branch.wallId}:${branch.role}`;
+        // The graph already proved this endpoint belongs to the node (including legacy
+        // face contacts). Never move through-branches or free endpoints here.
+        endpointTargets.set(key, { ...node.point });
+      }
+    }
+
+    let changed = false;
+    const next = current.map((wall) => {
+      const startTarget = endpointTargets.get(`${wall.id}:start`);
+      const endTarget = endpointTargets.get(`${wall.id}:end`);
+      const nextStart = startTarget || wallStart(wall);
+      const nextEnd = endTarget || wallEnd(wall);
+      if (
+        distance(nextStart, wallStart(wall)) > nodeToleranceMeters / 20 ||
+        distance(nextEnd, wallEnd(wall)) > nodeToleranceMeters / 20
+      ) {
+        changed = true;
+      }
+      return {
+        ...wall,
+        x1Meters: nextStart.x,
+        y1Meters: nextStart.y,
+        x2Meters: nextEnd.x,
+        y2Meters: nextEnd.y,
+      };
+    });
+
+    current = next;
+    if (!changed) break;
+  }
+
+  return current;
+};

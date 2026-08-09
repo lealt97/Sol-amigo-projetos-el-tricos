@@ -46,6 +46,7 @@ import {
 } from '../utils/nbrSheetEngine';
 import {
   analyzeWallNetwork,
+  canonicalizeWallCenterlineTopology,
   applyWallPrecisionConstraints,
   findClosedWallPerimeters,
   findClosedWallFaces,
@@ -753,9 +754,9 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
     hostNy: number;
   };
 
-  // Resolve a custom-wall junction against the PHYSICAL face of the host wall.
-  // Mid-segment hits become true butt/T junctions. Endpoint hits keep the shared
-  // center-axis node so L/end-to-end corners continue behaving like a polyline node.
+  // Resolve custom-wall topology on CENTER AXES only. Thickness and physical-face
+  // termination are derived at render time. Exact endpoint hits stay exact L/nodes;
+  // every non-zero position along the segment remains a T candidate.
   const getCustomWallSnapTarget = (
     point: { x: number; y: number },
     otherPoint?: { x: number; y: number },
@@ -782,7 +783,6 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
       const nx = -uy;
       const ny = ux;
       const thickness = host.thicknessMeters || wallThicknessMeters;
-      const half = thickness / 2;
       const start = { x: host.x1Meters, y: host.y1Meters };
       const end = { x: host.x2Meters, y: host.y2Meters };
 
@@ -829,38 +829,14 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
       // is excluded from segment/T classification because it was handled above.
       if (t <= endpointNodeEpsilon || t >= 1 - endpointNodeEpsilon) continue;
 
-      let face: CustomWallSnapTarget['face'] = 'axis';
-      let targetStart = start;
-      let targetEnd = end;
-
-      if (otherPoint) {
-        const branchDx = otherPoint.x - point.x;
-        const branchDy = otherPoint.y - point.y;
-        const branchLength = Math.hypot(branchDx, branchDy);
-        const normalRatio =
-          branchLength > 1e-9
-            ? Math.abs((branchDx / branchLength) * nx + (branchDy / branchLength) * ny)
-            : 0;
-
-        // A non-collinear branch terminates on the host face approached by its body.
-        if (normalRatio >= 0.2) {
-          const axisPoint = {
-            x: start.x + ux * length * t,
-            y: start.y + uy * length * t,
-          };
-          const signedSide = (otherPoint.x - axisPoint.x) * nx + (otherPoint.y - axisPoint.y) * ny;
-          const side = signedSide >= 0 ? 1 : -1;
-          face = side > 0 ? 'positive' : 'negative';
-          targetStart = { x: start.x + nx * half * side, y: start.y + ny * half * side };
-          targetEnd = { x: end.x + nx * half * side, y: end.y + ny * half * side };
-        }
-      }
-
-      const projection = projectPointToSegment(point, targetStart, targetEnd);
+      // Do not store a face point for custom walls. The logical node is always the
+      // orthogonal projection on the host centerline; getMultiNodeEndpointFacePoints()
+      // later trims the visible stem to the correct physical face.
+      const projection = projectPointToSegment(point, start, end);
       consider({
         wallId: host.id,
         kind: 'segment',
-        face,
+        face: 'axis',
         x: projection.x,
         y: projection.y,
         distance: projection.distance,
@@ -981,13 +957,41 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
       });
     }
 
-    const migratedWalls = floorPlanWalls
-      .map(normalizeWallConnections)
-      .map((wall) => ({
-        ...wall,
-        groupId: groupIdByWall.get(wall.id) || `wallgrp_${wall.id}`,
-      }));
-    const changed = migratedWalls.some((wall, index) => {
+    const normalizedWalls = floorPlanWalls.map(normalizeWallConnections);
+    const centerlineWalls = canonicalizeWallCenterlineTopology(normalizedWalls, {
+      defaultThicknessMeters: wallThicknessMeters,
+    });
+    const migratedWalls = centerlineWalls.map((wall) => ({
+      ...wall,
+      groupId: groupIdByWall.get(wall.id) || `wallgrp_${wall.id}`,
+    }));
+    const migratedWallById = new Map<string, FloorPlanWall>(migratedWalls.map((wall) => [wall.id, wall] as const));
+    const previousWallById = new Map<string, FloorPlanWall>(floorPlanWalls.map((wall) => [wall.id, wall] as const));
+    const migratedOpenings = floorPlanOpenings.map((opening) => {
+      if (!opening.wallId) return opening;
+      const previousWall = previousWallById.get(opening.wallId);
+      const nextWall = migratedWallById.get(opening.wallId);
+      if (!previousWall || !nextWall) return opening;
+      const previousDx = previousWall.x2Meters - previousWall.x1Meters;
+      const previousDy = previousWall.y2Meters - previousWall.y1Meters;
+      const oldRatio = Math.max(0, Math.min(1, opening.wallPositionRatio ?? 0.5));
+      const oldCenter = {
+        x: previousWall.x1Meters + previousDx * oldRatio,
+        y: previousWall.y1Meters + previousDy * oldRatio,
+      };
+      const nextDx = nextWall.x2Meters - nextWall.x1Meters;
+      const nextDy = nextWall.y2Meters - nextWall.y1Meters;
+      const nextLengthSq = nextDx * nextDx + nextDy * nextDy;
+      if (nextLengthSq < 1e-9) return opening;
+      const nextRatio = Math.max(0, Math.min(1,
+        ((oldCenter.x - nextWall.x1Meters) * nextDx + (oldCenter.y - nextWall.y1Meters) * nextDy) / nextLengthSq
+      ));
+      return Math.abs(nextRatio - oldRatio) <= 1e-9
+        ? opening
+        : { ...opening, wallPositionRatio: nextRatio };
+    });
+
+    const wallsChanged = migratedWalls.some((wall, index) => {
       const previous = floorPlanWalls[index];
       return (
         wall.roomId !== previous.roomId ||
@@ -998,7 +1002,10 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
         Math.abs(wall.y2Meters - previous.y2Meters) > 1e-6
       );
     });
-    if (!changed) return;
+    const openingsChanged = migratedOpenings.some((opening, index) =>
+      Math.abs((opening.wallPositionRatio ?? 0.5) - (floorPlanOpenings[index]?.wallPositionRatio ?? 0.5)) > 1e-9
+    );
+    if (!wallsChanged && !openingsChanged) return;
 
     const signature = JSON.stringify(
       migratedWalls.map((wall) => [
@@ -1009,7 +1016,7 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
         wall.y1Meters,
         wall.x2Meters,
         wall.y2Meters,
-      ])
+      ]).concat(migratedOpenings.map((opening) => [opening.id, opening.wallId, opening.wallPositionRatio]))
     );
     if (wallJunctionMigrationSignatureRef.current === signature) return;
     wallJunctionMigrationSignatureRef.current = signature;
@@ -1025,6 +1032,7 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
           openings: floorPlanOpenings,
         }),
         walls: migratedWalls,
+        openings: migratedOpenings,
       },
     });
   }, [
