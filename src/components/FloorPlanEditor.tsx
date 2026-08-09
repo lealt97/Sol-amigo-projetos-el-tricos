@@ -48,6 +48,7 @@ import {
   analyzeWallNetwork,
   applyWallPrecisionConstraints,
   findClosedWallPerimeters,
+  findClosedWallFaces,
   findWallNodeNearPoint,
   getConnectedWallIds,
   type WallGraphNode,
@@ -568,6 +569,10 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
   const wallGraph = wallCadAnalysis.graph;
   const closedWallPerimeters = useMemo(
     () => findClosedWallPerimeters(floorPlanWalls, { defaultThicknessMeters: wallThicknessMeters }),
+    [floorPlanWalls, wallThicknessMeters]
+  );
+  const closedWallFaces = useMemo(
+    () => findClosedWallFaces(floorPlanWalls, { defaultThicknessMeters: wallThicknessMeters }),
     [floorPlanWalls, wallThicknessMeters]
   );
 
@@ -3713,10 +3718,12 @@ function distToSegment(
               }
             >
               CAD: {wallGraph.nodes.filter((node) => node.wallIds.length >= 2).length} nós •{' '}
-              {wallCadAnalysis.componentCount} rede(s) • {closedWallPerimeters.length} perímetro(s) fechado(s) •{' '}
-              {closedWallPerimeters.length > 0
-                ? `${closedWallPerimeters.reduce((sum, perimeter) => sum + perimeter.areaSquareMeters, 0).toFixed(2)} m² • `
-                : ''}
+              {wallCadAnalysis.componentCount} rede(s) • {closedWallFaces.length} ambiente(s) fechado(s) •{' '}
+              {closedWallFaces.length > 0
+                ? `${closedWallFaces.reduce((sum, face) => sum + face.clearAreaSquareMeters, 0).toFixed(2)} m² livres • `
+                : closedWallPerimeters.length > 0
+                  ? `${closedWallPerimeters.length} perímetro(s) simples • `
+                  : ''}
               {wallCadAnalysis.issues.length === 0 ? 'íntegro' : `${wallCadAnalysis.issues.length} alerta(s)`}
             </div>
             <span className="text-[11px] font-bold text-blue-900">
@@ -5042,18 +5049,21 @@ function distToSegment(
                 );
               })()}
 
-              {/* Closed wall-only perimeters detected by the CAD graph. */}
-              {showDimensions && closedWallPerimeters.map((perimeter) => {
-                const cx = perimeter.centroid.x * scalePxPerMeter;
-                const cy = perimeter.centroid.y * scalePxPerMeter;
+              {/* Bounded planar faces: internal partitions remain measurable as individual rooms. */}
+              {showDimensions && closedWallFaces.map((face, faceIndex) => {
+                const cx = face.centroid.x * scalePxPerMeter;
+                const cy = face.centroid.y * scalePxPerMeter;
                 return (
-                  <g key={perimeter.id} transform={`translate(${cx}, ${cy})`} pointerEvents="none">
-                    <rect x="-62" y="-13" width="124" height="26" fill="white" fillOpacity="0.9" stroke="#0f766e" strokeWidth="1" />
-                    <text x="0" y="-1" textAnchor="middle" fill="#115e59" fontSize="9" fontWeight="black">
-                      PERÍMETRO FECHADO
+                  <g key={face.id} transform={`translate(${cx}, ${cy})`} pointerEvents="none">
+                    <rect x="-70" y="-17" width="140" height="34" fill="white" fillOpacity="0.92" stroke="#0f766e" strokeWidth="1" />
+                    <text x="0" y="-5" textAnchor="middle" fill="#115e59" fontSize="9" fontWeight="black">
+                      AMBIENTE {faceIndex + 1}
                     </text>
-                    <text x="0" y="9" textAnchor="middle" fill="#115e59" fontSize="9" fontWeight="bold">
-                      {perimeter.areaSquareMeters.toFixed(2)} m² • P {perimeter.perimeterMeters.toFixed(2)} m
+                    <text x="0" y="6" textAnchor="middle" fill="#115e59" fontSize="9" fontWeight="bold">
+                      LIVRE {face.clearAreaSquareMeters.toFixed(2)} m²
+                    </text>
+                    <text x="0" y="15" textAnchor="middle" fill="#475569" fontSize="7.5" fontWeight="bold">
+                      EIXOS {face.axisAreaSquareMeters.toFixed(2)} m²
                     </text>
                   </g>
                 );
