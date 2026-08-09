@@ -5,6 +5,7 @@ import {
   applyWallPrecisionConstraints,
   buildWallGraph,
   findClosedWallPerimeters,
+  findClosedWallFaces,
   findWallNodeNearPoint,
   getConnectedWallIds,
 } from '../src/utils/wallCadEngine';
@@ -181,5 +182,61 @@ const nodeAt = (walls: FloorPlanWall[], x: number, y: number, radius = 0.004) =>
   assert.equal(findClosedWallPerimeters(walls).length, 0);
 }
 
-console.log('wall-cad-regression: 13 cenários críticos passaram');
+
+// 14) Uma divisória interna transforma um perímetro em duas faces, sem perder os ambientes.
+{
+  const walls = [
+    wall('top', 0, 0, 4, 0),
+    wall('right', 4, 0, 4, 3),
+    wall('bottom', 4, 3, 0, 3),
+    wall('left', 0, 3, 0, 0),
+    wall('partition', 2, 0, 2, 3),
+  ];
+  const faces = findClosedWallFaces(walls);
+  assert.equal(faces.length, 2);
+  assert.ok(faces.every((face) => Math.abs(face.axisAreaSquareMeters - 6) < 1e-8));
+  assert.ok(faces.every((face) => face.clearAreaSquareMeters > 5 && face.clearAreaSquareMeters < 6));
+}
+
+// 15) Divisória armazenada nas faces físicas superior/inferior ainda fecha duas faces lógicas.
+{
+  const walls = [
+    wall('top', 0, 0, 4, 0, 0.15),
+    wall('right', 4, 0, 4, 3, 0.15),
+    wall('bottom', 4, 3, 0, 3, 0.15),
+    wall('left', 0, 3, 0, 0, 0.15),
+    wall('partition', 2, 0.075, 2, 2.925, 0.15),
+  ];
+  const faces = findClosedWallFaces(walls);
+  assert.equal(faces.length, 2);
+  assert.ok(Math.abs(faces.reduce((sum, face) => sum + face.axisAreaSquareMeters, 0) - 12) < 1e-8);
+}
+
+// 16) Cruz de duas divisórias dentro do retângulo gera quatro ambientes fechados.
+{
+  const walls = [
+    wall('top', 0, 0, 4, 0),
+    wall('right', 4, 0, 4, 3),
+    wall('bottom', 4, 3, 0, 3),
+    wall('left', 0, 3, 0, 0),
+    wall('vertical', 2, 0, 2, 3),
+    wall('horizontal', 0, 1.5, 4, 1.5),
+  ];
+  const faces = findClosedWallFaces(walls);
+  assert.equal(faces.length, 4);
+  assert.ok(faces.every((face) => Math.abs(face.axisAreaSquareMeters - 3) < 1e-8));
+}
+
+// 17) Rede aberta não produz faces falsas.
+{
+  const walls = [
+    wall('a', 0, 0, 3, 0),
+    wall('b', 3, 0, 3, 2),
+    wall('c', 3, 2, 1, 2),
+  ];
+  assert.equal(findClosedWallFaces(walls).length, 0);
+}
+
+console.log('wall-cad-regression: 17 cenários críticos passaram');
+
 

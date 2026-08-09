@@ -851,3 +851,290 @@ export const findClosedWallPerimeters = (
 
   return result.sort((a, b) => b.areaSquareMeters - a.areaSquareMeters);
 };
+
+
+export interface ClosedWallFace {
+  id: string;
+  wallIds: string[];
+  axisPoints: CadPoint[];
+  clearPoints: CadPoint[];
+  axisAreaSquareMeters: number;
+  clearAreaSquareMeters: number;
+  axisPerimeterMeters: number;
+  clearPerimeterMeters: number;
+  centroid: CadPoint;
+}
+
+type PlanarAtomicEdge = {
+  id: string;
+  a: string;
+  b: string;
+  wallId: string;
+  thicknessMeters: number;
+};
+
+const signedPolygonArea = (points: CadPoint[]) => {
+  let twiceArea = 0;
+  for (let i = 0; i < points.length; i += 1) {
+    const current = points[i];
+    const next = points[(i + 1) % points.length];
+    twiceArea += current.x * next.y - next.x * current.y;
+  }
+  return twiceArea / 2;
+};
+
+const polygonPerimeter = (points: CadPoint[]) =>
+  points.reduce(
+    (sum, point, index) => sum + distance(point, points[(index + 1) % points.length]),
+    0
+  );
+
+const intersectInfiniteLines = (
+  a: CadPoint,
+  aDir: CadPoint,
+  b: CadPoint,
+  bDir: CadPoint
+): CadPoint | null => {
+  const denominator = cross(aDir, bDir);
+  if (Math.abs(denominator) <= 1e-9) return null;
+  const rel = { x: b.x - a.x, y: b.y - a.y };
+  const t = cross(rel, bDir) / denominator;
+  return { x: a.x + aDir.x * t, y: a.y + aDir.y * t };
+};
+
+const clearPolygonFromBoundary = (
+  points: CadPoint[],
+  edgeThicknesses: number[]
+): CadPoint[] => {
+  if (points.length < 3 || edgeThicknesses.length !== points.length) return [];
+
+  const offsetLines = points.map((point, index) => {
+    const next = points[(index + 1) % points.length];
+    const direction = normalizeVector({ x: next.x - point.x, y: next.y - point.y });
+    if (!direction) return null;
+    // Positive face cycles run clockwise in screen coordinates (Y down), therefore the
+    // interior lies on the visual right side: right normal = (-uy, ux).
+    const rightNormal = { x: -direction.y, y: direction.x };
+    const offset = Math.max(0.001, edgeThicknesses[index]) / 2;
+    return {
+      origin: {
+        x: point.x + rightNormal.x * offset,
+        y: point.y + rightNormal.y * offset,
+      },
+      direction,
+      rightNormal,
+      offset,
+    };
+  });
+  if (offsetLines.some((line) => !line)) return [];
+
+  const clearPoints: CadPoint[] = [];
+  for (let index = 0; index < points.length; index += 1) {
+    const previous = offsetLines[(index - 1 + points.length) % points.length]!;
+    const current = offsetLines[index]!;
+    const intersection = intersectInfiniteLines(
+      previous.origin,
+      previous.direction,
+      current.origin,
+      current.direction
+    );
+    if (intersection) {
+      // Refuse pathological long miters at nearly parallel/re-entrant edges.
+      const maxOffset = Math.max(previous.offset, current.offset);
+      if (distance(intersection, points[index]) <= Math.max(1, maxOffset * 12)) {
+        clearPoints.push(intersection);
+        continue;
+      }
+    }
+    clearPoints.push({
+      x: points[index].x + (previous.rightNormal.x * previous.offset + current.rightNormal.x * current.offset) / 2,
+      y: points[index].y + (previous.rightNormal.y * previous.offset + current.rightNormal.y * current.offset) / 2,
+    });
+  }
+  return clearPoints;
+};
+
+/**
+ * Extracts bounded faces from the custom-wall planar graph. Unlike the simple-perimeter
+ * helper, this keeps working after internal partitions, T junctions and center crossings.
+ * Every wall is virtually split at logical graph nodes for topology only; persisted wall
+ * objects remain untouched.
+ */
+export const findClosedWallFaces = (
+  walls: FloorPlanWall[],
+  options: WallGraphOptions = {}
+): ClosedWallFace[] => {
+  if (walls.length < 3) return [];
+  const graph = buildWallGraph(walls, options);
+  const defaultThicknessMeters = options.defaultThicknessMeters ?? 0.15;
+  const nodeToleranceMeters = options.nodeToleranceMeters ?? CAD_NODE_TOLERANCE_M;
+  const vertexTolerance = Math.max(1e-6, nodeToleranceMeters / 10);
+
+  const vertices = new Map<string, CadPoint>();
+  const vertexKey = (point: CadPoint) => {
+    const key = `${Math.round(point.x / vertexTolerance)}:${Math.round(point.y / vertexTolerance)}`;
+    if (!vertices.has(key)) vertices.set(key, { ...point });
+    return key;
+  };
+
+  const atomicEdges: PlanarAtomicEdge[] = [];
+  const edgeKeySet = new Set<string>();
+
+  for (const wall of walls) {
+    const start = wallStart(wall);
+    const end = wallEnd(wall);
+    const vx = end.x - start.x;
+    const vy = end.y - start.y;
+    const lengthSq = vx * vx + vy * vy;
+    const length = Math.sqrt(lengthSq);
+    if (length <= CAD_GEOMETRY_EPSILON_M) continue;
+
+    const half = wallThickness(wall, defaultThicknessMeters) / 2;
+    const extensionT = (half + (options.contactToleranceMeters ?? CAD_CONTACT_TOLERANCE_M) + 0.01) / length;
+    const splitTs = [0, 1];
+    for (const node of graph.nodes) {
+      if (!node.wallIds.includes(wall.id)) continue;
+      const t = ((node.point.x - start.x) * vx + (node.point.y - start.y) * vy) / lengthSq;
+      const projected = { x: start.x + vx * t, y: start.y + vy * t };
+      if (distance(projected, node.point) > Math.max(0.006, nodeToleranceMeters * 2)) continue;
+      if (t >= -extensionT && t <= 1 + extensionT) splitTs.push(t);
+    }
+
+    splitTs.sort((a, b) => a - b);
+    const uniqueTs = splitTs.filter((value, index) =>
+      index === 0 || Math.abs(value - splitTs[index - 1]) * length > vertexTolerance
+    );
+
+    for (let index = 0; index < uniqueTs.length - 1; index += 1) {
+      const t1 = uniqueTs[index];
+      const t2 = uniqueTs[index + 1];
+      if ((t2 - t1) * length <= vertexTolerance) continue;
+      const p1 = { x: start.x + vx * t1, y: start.y + vy * t1 };
+      const p2 = { x: start.x + vx * t2, y: start.y + vy * t2 };
+      const a = vertexKey(p1);
+      const b = vertexKey(p2);
+      if (a === b) continue;
+      const undirected = a < b ? `${a}|${b}` : `${b}|${a}`;
+      if (edgeKeySet.has(undirected)) continue;
+      edgeKeySet.add(undirected);
+      atomicEdges.push({
+        id: `edge_${atomicEdges.length}`,
+        a,
+        b,
+        wallId: wall.id,
+        thicknessMeters: wallThickness(wall, defaultThicknessMeters),
+      });
+    }
+  }
+
+  const adjacency = new Map<string, PlanarAtomicEdge[]>();
+  atomicEdges.forEach((edge) => {
+    adjacency.set(edge.a, [...(adjacency.get(edge.a) || []), edge]);
+    adjacency.set(edge.b, [...(adjacency.get(edge.b) || []), edge]);
+  });
+
+  const sortedNeighbors = new Map<string, string[]>();
+  adjacency.forEach((edges, key) => {
+    const point = vertices.get(key)!;
+    const neighbors = Array.from(new Set(edges.map((edge) => edge.a === key ? edge.b : edge.a)));
+    neighbors.sort((leftKey, rightKey) => {
+      const left = vertices.get(leftKey)!;
+      const right = vertices.get(rightKey)!;
+      const leftAngle = Math.atan2(left.y - point.y, left.x - point.x);
+      const rightAngle = Math.atan2(right.y - point.y, right.x - point.x);
+      return leftAngle - rightAngle;
+    });
+    sortedNeighbors.set(key, neighbors);
+  });
+
+  const edgeByPair = new Map<string, PlanarAtomicEdge>();
+  atomicEdges.forEach((edge) => {
+    edgeByPair.set(`${edge.a}>${edge.b}`, edge);
+    edgeByPair.set(`${edge.b}>${edge.a}`, edge);
+  });
+
+  const visitedDirected = new Set<string>();
+  const rawFaces: Array<{
+    vertexKeys: string[];
+    edges: PlanarAtomicEdge[];
+  }> = [];
+
+  for (const edge of atomicEdges) {
+    for (const [startA, startB] of [[edge.a, edge.b], [edge.b, edge.a]] as const) {
+      const startDirected = `${startA}>${startB}`;
+      if (visitedDirected.has(startDirected)) continue;
+
+      const vertexKeys: string[] = [];
+      const faceEdges: PlanarAtomicEdge[] = [];
+      let u = startA;
+      let v = startB;
+      let closed = false;
+
+      for (let guard = 0; guard < atomicEdges.length * 4 + 8; guard += 1) {
+        const directed = `${u}>${v}`;
+        if (visitedDirected.has(directed) && directed !== startDirected) break;
+        visitedDirected.add(directed);
+        vertexKeys.push(u);
+        const currentEdge = edgeByPair.get(directed);
+        if (!currentEdge) break;
+        faceEdges.push(currentEdge);
+
+        const neighbors = sortedNeighbors.get(v) || [];
+        const reverseIndex = neighbors.indexOf(u);
+        if (reverseIndex < 0 || neighbors.length < 2) break;
+        const next = neighbors[(reverseIndex - 1 + neighbors.length) % neighbors.length];
+        u = v;
+        v = next;
+        if (u === startA && v === startB) {
+          closed = true;
+          break;
+        }
+      }
+
+      if (closed && vertexKeys.length >= 3 && faceEdges.length === vertexKeys.length) {
+        rawFaces.push({ vertexKeys, edges: faceEdges });
+      }
+    }
+  }
+
+  const faces: ClosedWallFace[] = [];
+  const canonicalFaces = new Set<string>();
+  for (const rawFace of rawFaces) {
+    const axisPoints = rawFace.vertexKeys.map((key) => vertices.get(key)!).filter(Boolean);
+    const signedArea = signedPolygonArea(axisPoints);
+    // With screen-style coordinates (Y grows down) and the right-face walker above,
+    // bounded interior faces are clockwise and therefore positive. The exterior is negative.
+    if (signedArea <= 0.005) continue;
+
+    const canonical = [...rawFace.vertexKeys].sort().join('|');
+    if (canonicalFaces.has(canonical)) continue;
+    canonicalFaces.add(canonical);
+
+    const edgeThicknesses = rawFace.edges.map((edge) => edge.thicknessMeters);
+    const clearPoints = clearPolygonFromBoundary(axisPoints, edgeThicknesses);
+    const clearGeometry = clearPoints.length >= 3
+      ? polygonAreaAndCentroid(clearPoints)
+      : { area: 0, centroid: polygonAreaAndCentroid(axisPoints).centroid };
+    const axisGeometry = polygonAreaAndCentroid(axisPoints);
+    const wallIds = Array.from(new Set(rawFace.edges.map((edge) => edge.wallId))).sort();
+
+    faces.push({
+      id: `wallface_${faces.length}_${wallIds.join('_')}`,
+      wallIds,
+      axisPoints: axisPoints.map((point) => ({ ...point })),
+      clearPoints: clearPoints.map((point) => ({ ...point })),
+      axisAreaSquareMeters: axisGeometry.area,
+      clearAreaSquareMeters: clearGeometry.area,
+      axisPerimeterMeters: polygonPerimeter(axisPoints),
+      clearPerimeterMeters: clearPoints.length >= 3 ? polygonPerimeter(clearPoints) : 0,
+      centroid: clearGeometry.centroid,
+    });
+  }
+
+  return faces.sort((a, b) => {
+    if (Math.abs(b.clearAreaSquareMeters - a.clearAreaSquareMeters) > 1e-9) {
+      return b.clearAreaSquareMeters - a.clearAreaSquareMeters;
+    }
+    return a.id.localeCompare(b.id);
+  });
+};
