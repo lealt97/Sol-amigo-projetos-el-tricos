@@ -738,11 +738,12 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
       const start = { x: host.x1Meters, y: host.y1Meters };
       const end = { x: host.x2Meters, y: host.y2Meters };
 
-      // True endpoint nodes retain axis semantics. Keep their attraction local so a
-      // cursor near the middle of a short wall does not jump to an endpoint.
-      const endpointSnapRange = Math.min(maxDistance, Math.max(0.10, half + 0.03));
+      // L is allowed only at the exact endpoint node. There is intentionally no
+      // endpoint attraction radius: any non-zero distance from the corner must remain
+      // eligible for a physical-face T junction. The epsilon only absorbs floating-point noise.
+      const endpointNodeEpsilon = 1e-6;
       const startDistance = Math.hypot(point.x - start.x, point.y - start.y);
-      if (startDistance <= endpointSnapRange) {
+      if (startDistance <= endpointNodeEpsilon) {
         consider({
           wallId: host.id,
           kind: 'endpoint',
@@ -758,7 +759,7 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
         });
       }
       const endDistance = Math.hypot(point.x - end.x, point.y - end.y);
-      if (endDistance <= endpointSnapRange) {
+      if (endDistance <= endpointNodeEpsilon) {
         consider({
           wallId: host.id,
           kind: 'endpoint',
@@ -776,8 +777,9 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
 
       const rawT = ((point.x - start.x) * dx + (point.y - start.y) * dy) / (length * length);
       const t = Math.max(0, Math.min(1, rawT));
-      const endpointBand = Math.min(0.18, Math.max(0.025, (half + 0.025) / length));
-      if (t <= endpointBand || t >= 1 - endpointBand) continue;
+      // Do not reserve a near-corner band for L. Only the mathematical endpoint itself
+      // is excluded from segment/T classification because it was handled above.
+      if (t <= endpointNodeEpsilon || t >= 1 - endpointNodeEpsilon) continue;
 
       let face: CustomWallSnapTarget['face'] = 'axis';
       let targetStart = start;
