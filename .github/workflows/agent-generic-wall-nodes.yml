@@ -1,0 +1,45 @@
+name: Agent generic wall nodes
+
+on:
+  push:
+    branches:
+      - agent/generic-wall-nodes
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-validate:
+    if: ${{ !contains(github.event.head_commit.message, '[agent-done]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/generic-wall-nodes
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Apply generic node patch
+        run: python scripts/generalize_wall_nodes.py
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: TypeScript validation
+        run: npm run lint
+
+      - name: Production build
+        run: npm run build
+
+      - name: Commit validated change
+        run: |
+          git config user.name "Renan Leal"
+          git config user.email "lealt97@gmail.com"
+          git add src/components/FloorPlanEditor.tsx
+          git commit -m "feat: generalizar nos de parede extensíveis [agent-done]"
+          git push origin agent/generic-wall-nodes
