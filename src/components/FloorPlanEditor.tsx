@@ -825,6 +825,25 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
     return best;
   };
 
+  const getRoomIdAtPoint = (point: { x: number; y: number }, tolerance = 0.03): string | undefined => {
+    const candidates = roomsWithGeometry
+      .filter((room) => {
+        if (room.x === undefined || room.y === undefined || !room.widthMeters || !room.heightMeters) return false;
+        return (
+          point.x >= room.x - tolerance &&
+          point.x <= room.x + room.widthMeters + tolerance &&
+          point.y >= room.y - tolerance &&
+          point.y <= room.y + room.heightMeters + tolerance
+        );
+      })
+      .sort((a, b) =>
+        (a.widthMeters || 0) * (a.heightMeters || 0) -
+        (b.widthMeters || 0) * (b.heightMeters || 0)
+      );
+
+    return candidates[0]?.id;
+  };
+
   const normalizeWallConnections = (wall: FloorPlanWall): FloorPlanWall => {
     const maxDistance = Math.max(0.4, wallThicknessMeters * 2.5);
     const start = { x: wall.x1Meters, y: wall.y1Meters };
@@ -843,13 +862,49 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
 
     const startTarget = resolveEndpoint(start, end);
     const endTarget = resolveEndpoint(end, start);
+    const normalizedStart = {
+      x: startTarget?.x ?? wall.x1Meters,
+      y: startTarget?.y ?? wall.y1Meters,
+    };
+    const normalizedEnd = {
+      x: endTarget?.x ?? wall.x2Meters,
+      y: endTarget?.y ?? wall.y2Meters,
+    };
+
+    // A custom wall is part of the architectural room/planta it is drawn inside or
+    // attached to. This ownership makes room dragging a true grouped architectural move.
+    const existingRoomId = wall.roomId && roomsWithGeometry.some((room) => room.id === wall.roomId)
+      ? wall.roomId
+      : undefined;
+    const midpointRoomId = getRoomIdAtPoint({
+      x: (normalizedStart.x + normalizedEnd.x) / 2,
+      y: (normalizedStart.y + normalizedEnd.y) / 2,
+    });
+
+    const connectedRoomIds = [startTarget, endTarget]
+      .flatMap((target) => {
+        if (!target) return [];
+        if ('roomId' in target) return [target.roomId];
+        if ('wallId' in target) {
+          const host = floorPlanWalls.find((item) => item.id === target.wallId);
+          return host?.roomId ? [host.roomId] : [];
+        }
+        return [];
+      })
+      .filter((roomId): roomId is string => Boolean(roomId));
+    const uniqueConnectedRoomIds = Array.from(new Set(connectedRoomIds));
+    const inferredRoomId =
+      existingRoomId ||
+      midpointRoomId ||
+      (uniqueConnectedRoomIds.length === 1 ? uniqueConnectedRoomIds[0] : undefined);
 
     return {
       ...wall,
-      x1Meters: startTarget?.x ?? wall.x1Meters,
-      y1Meters: startTarget?.y ?? wall.y1Meters,
-      x2Meters: endTarget?.x ?? wall.x2Meters,
-      y2Meters: endTarget?.y ?? wall.y2Meters,
+      roomId: inferredRoomId,
+      x1Meters: normalizedStart.x,
+      y1Meters: normalizedStart.y,
+      x2Meters: normalizedEnd.x,
+      y2Meters: normalizedEnd.y,
     };
   };
 
@@ -863,6 +918,7 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
     const changed = migratedWalls.some((wall, index) => {
       const previous = floorPlanWalls[index];
       return (
+        wall.roomId !== previous.roomId ||
         Math.abs(wall.x1Meters - previous.x1Meters) > 1e-6 ||
         Math.abs(wall.y1Meters - previous.y1Meters) > 1e-6 ||
         Math.abs(wall.x2Meters - previous.x2Meters) > 1e-6 ||
@@ -872,7 +928,7 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
     if (!changed) return;
 
     const signature = JSON.stringify(
-      migratedWalls.map((wall) => [wall.id, wall.x1Meters, wall.y1Meters, wall.x2Meters, wall.y2Meters])
+      migratedWalls.map((wall) => [wall.id, wall.roomId, wall.x1Meters, wall.y1Meters, wall.x2Meters, wall.y2Meters])
     );
     if (wallJunctionMigrationSignatureRef.current === signature) return;
     wallJunctionMigrationSignatureRef.current = signature;
@@ -1104,7 +1160,7 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
         { x: wall.x1Meters, y: wall.y1Meters },
         { x: wall.x2Meters, y: wall.y2Meters },
         wall.thicknessMeters || wallThicknessMeters,
-        { wallId: wall.id }
+        { wallId: wall.id, roomId: wall.roomId }
       ));
     }
 
@@ -1131,7 +1187,7 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
           { x: wall.x1Meters, y: wall.y1Meters },
           { x: wall.x2Meters, y: wall.y2Meters },
           wall.thicknessMeters || wallThicknessMeters,
-          { wallId: wall.id }
+          { wallId: wall.id, roomId: wall.roomId }
         );
         if (anchored) {
           const { distance: _distance, ...placement } = anchored;
@@ -1222,16 +1278,48 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
     if (kind === 'room') {
       const room = roomsWithGeometry.find((item) => item.id === id);
       if (!room) return;
+
+      const roomWalls = floorPlanWalls
+        .filter((item) => {
+          if (item.roomId === id) return true;
+          const midpoint = {
+            x: (item.x1Meters + item.x2Meters) / 2,
+            y: (item.y1Meters + item.y2Meters) / 2,
+          };
+          return getRoomIdAtPoint(midpoint) === id;
+        })
+        .map((item) => ({ ...item }));
+      const roomWallIds = new Set(roomWalls.map((item) => item.id));
+      const pointInsideDraggedRoom = (x: number, y: number) =>
+        room.x !== undefined &&
+        room.y !== undefined &&
+        Boolean(room.widthMeters) &&
+        Boolean(room.heightMeters) &&
+        x >= room.x - 0.03 &&
+        x <= room.x + (room.widthMeters || 0) + 0.03 &&
+        y >= room.y - 0.03 &&
+        y <= room.y + (room.heightMeters || 0) + 0.03;
+
+      const roomSymbols = floorPlanSymbols
+        .filter((item) => item.roomId === id || (!item.roomId && pointInsideDraggedRoom(item.xMeters, item.yMeters)))
+        .map((item) => ({ ...item, roomId: item.roomId || id }));
+      const roomOpenings = floorPlanOpenings
+        .filter((item) =>
+          item.roomId === id ||
+          Boolean(item.wallId && roomWallIds.has(item.wallId))
+        )
+        .map((item) => ({ ...item, roomId: item.roomId || id }));
+
       setElementDrag({
         kind,
         id,
         startPointer,
         room: { ...room },
-        childSymbols: floorPlanSymbols.filter((item) => item.roomId === id).map((item) => ({ ...item })),
-        childOpenings: floorPlanOpenings.filter((item) => item.roomId === id).map((item) => ({ ...item })),
-        childWalls: floorPlanWalls.filter((item) => item.roomId === id).map((item) => ({ ...item })),
+        childSymbols: roomSymbols,
+        childOpenings: roomOpenings,
+        childWalls: roomWalls,
       });
-      setToolStatus(`Arrastando cômodo: ${room.name}. Elementos vinculados acompanham.`);
+      setToolStatus(`Arrastando cômodo: ${room.name}. Paredes e elementos da planta acompanham.`);
       return;
     }
 
@@ -1375,6 +1463,7 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
         circuitNumber: symbolCircuitNum,
         commandLetter: symbolCommandLetter,
         powerVA: symbolPowerVA,
+        roomId: getRoomIdAtPoint(coords),
         label: `${selectedSymbolType.toUpperCase()} C${symbolCircuitNum}`,
       };
 
@@ -1439,13 +1528,23 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
         const updatedSymbols = floorPlanSymbols.map((symbol) => {
           const original = childSymbols.get(symbol.id);
           return original
-            ? { ...symbol, xMeters: original.xMeters + appliedX, yMeters: original.yMeters + appliedY }
+            ? {
+                ...symbol,
+                roomId: original.roomId || elementDrag.id,
+                xMeters: original.xMeters + appliedX,
+                yMeters: original.yMeters + appliedY,
+              }
             : symbol;
         });
         const updatedOpenings = floorPlanOpenings.map((opening) => {
           const original = childOpenings.get(opening.id);
           return original
-            ? { ...opening, xMeters: original.xMeters + appliedX, yMeters: original.yMeters + appliedY }
+            ? {
+                ...opening,
+                roomId: original.roomId || elementDrag.id,
+                xMeters: original.xMeters + appliedX,
+                yMeters: original.yMeters + appliedY,
+              }
             : opening;
         });
         const updatedWalls = floorPlanWalls.map((wall) => {
@@ -1453,6 +1552,7 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
           return original
             ? {
                 ...wall,
+                roomId: original.roomId || elementDrag.id,
                 x1Meters: original.x1Meters + appliedX,
                 y1Meters: original.y1Meters + appliedY,
                 x2Meters: original.x2Meters + appliedX,
