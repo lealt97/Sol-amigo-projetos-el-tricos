@@ -1197,3 +1197,136 @@ export const canonicalizeWallCenterlineTopology = (
 
   return current;
 };
+
+
+export interface WallSelectionBounds {
+  minX: number;
+  minY: number;
+  maxX: number;
+  maxY: number;
+  center: CadPoint;
+}
+
+export const getWallSelectionBounds = (
+  walls: FloorPlanWall[],
+  wallIds?: Iterable<string>
+): WallSelectionBounds | null => {
+  const idSet = wallIds ? new Set(wallIds) : null;
+  const selected = idSet ? walls.filter((wall) => idSet.has(wall.id)) : walls;
+  if (selected.length === 0) return null;
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  selected.forEach((wall) => {
+    minX = Math.min(minX, wall.x1Meters, wall.x2Meters);
+    minY = Math.min(minY, wall.y1Meters, wall.y2Meters);
+    maxX = Math.max(maxX, wall.x1Meters, wall.x2Meters);
+    maxY = Math.max(maxY, wall.y1Meters, wall.y2Meters);
+  });
+  return {
+    minX,
+    minY,
+    maxX,
+    maxY,
+    center: { x: (minX + maxX) / 2, y: (minY + maxY) / 2 },
+  };
+};
+
+/** Translate only the requested wall axes. Internal shared nodes remain bit-identical. */
+export const translateWallSelection = (
+  walls: FloorPlanWall[],
+  wallIds: Iterable<string>,
+  dxMeters: number,
+  dyMeters: number
+): FloorPlanWall[] => {
+  const ids = new Set(wallIds);
+  if (!Number.isFinite(dxMeters) || !Number.isFinite(dyMeters)) return walls.map((wall) => ({ ...wall }));
+  return walls.map((wall) =>
+    ids.has(wall.id)
+      ? {
+          ...wall,
+          x1Meters: wall.x1Meters + dxMeters,
+          y1Meters: wall.y1Meters + dyMeters,
+          x2Meters: wall.x2Meters + dxMeters,
+          y2Meters: wall.y2Meters + dyMeters,
+        }
+      : { ...wall }
+  );
+};
+
+export const rotatePointAround = (point: CadPoint, pivot: CadPoint, angleDeg: number): CadPoint => {
+  const angleRad = (angleDeg * Math.PI) / 180;
+  const cos = Math.cos(angleRad);
+  const sin = Math.sin(angleRad);
+  const dx = point.x - pivot.x;
+  const dy = point.y - pivot.y;
+  return {
+    x: pivot.x + dx * cos - dy * sin,
+    y: pivot.y + dx * sin + dy * cos,
+  };
+};
+
+/** Rotate a selected wall network around an explicit pivot or its bounding-box center. */
+export const rotateWallSelection = (
+  walls: FloorPlanWall[],
+  wallIds: Iterable<string>,
+  angleDeg: number,
+  pivot?: CadPoint
+): FloorPlanWall[] => {
+  const ids = new Set(wallIds);
+  if (!Number.isFinite(angleDeg) || ids.size === 0) return walls.map((wall) => ({ ...wall }));
+  const center = pivot || getWallSelectionBounds(walls, ids)?.center;
+  if (!center) return walls.map((wall) => ({ ...wall }));
+  return walls.map((wall) => {
+    if (!ids.has(wall.id)) return { ...wall };
+    const p1 = rotatePointAround(wallStart(wall), center, angleDeg);
+    const p2 = rotatePointAround(wallEnd(wall), center, angleDeg);
+    return {
+      ...wall,
+      x1Meters: p1.x,
+      y1Meters: p1.y,
+      x2Meters: p2.x,
+      y2Meters: p2.y,
+    };
+  });
+};
+
+/** Create the centerline geometry of a parallel wall. Positive distance uses the stored left normal. */
+export const offsetWallCenterline = (
+  wall: FloorPlanWall,
+  distanceMeters: number
+): FloorPlanWall | null => {
+  if (!Number.isFinite(distanceMeters)) return null;
+  const direction = normalizeVector({
+    x: wall.x2Meters - wall.x1Meters,
+    y: wall.y2Meters - wall.y1Meters,
+  });
+  if (!direction) return null;
+  const normal = { x: -direction.y, y: direction.x };
+  return {
+    ...wall,
+    x1Meters: wall.x1Meters + normal.x * distanceMeters,
+    y1Meters: wall.y1Meters + normal.y * distanceMeters,
+    x2Meters: wall.x2Meters + normal.x * distanceMeters,
+    y2Meters: wall.y2Meters + normal.y * distanceMeters,
+  };
+};
+
+/** Set P2 by exact architectural length/angle while keeping P1 fixed. */
+export const setWallEndByLengthAngle = (
+  wall: FloorPlanWall,
+  lengthMeters: number,
+  angleDeg: number
+): FloorPlanWall => {
+  const constrained = applyWallPrecisionConstraints(
+    wallStart(wall),
+    wallEnd(wall),
+    { lockedLengthMeters: lengthMeters, lockedAngleDeg: angleDeg }
+  );
+  return {
+    ...wall,
+    x2Meters: constrained.point.x,
+    y2Meters: constrained.point.y,
+  };
+};
