@@ -44,6 +44,13 @@ import {
   isSupportedDrawingScale,
   paperMmToCanvasPx,
 } from '../utils/nbrSheetEngine';
+import {
+  analyzeWallNetwork,
+  findWallNodeNearPoint,
+  getConnectedWallIds,
+  type WallGraphNode,
+  type WallNodeBranch,
+} from '../utils/wallCadEngine';
 
 interface FloorPlanEditorProps {
   projectData: ProjectData;
@@ -528,6 +535,15 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
   const floorPlanOpenings = projectData.floorPlan?.openings || [];
   const floorPlanWalls = projectData.floorPlan?.walls || [];
 
+  // Single source of truth for custom-wall topology. The graph understands exact shared
+  // endpoints, physical-face T contacts and center-axis crossings, so grouping, grips,
+  // diagnostics and junction rendering no longer disagree about what is connected.
+  const wallCadAnalysis = useMemo(
+    () => analyzeWallNetwork(floorPlanWalls, { defaultThicknessMeters: wallThicknessMeters }),
+    [floorPlanWalls, wallThicknessMeters]
+  );
+  const wallGraph = wallCadAnalysis.graph;
+
   // A room is stored by its architectural outer rectangle, while the rendered masonry
   // grows inward. Keep axis + both physical faces so a custom wall can make a true
   // architectural butt/T connection instead of piercing through the host wall.
@@ -827,52 +843,8 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
     return best;
   };
 
-  const getConnectedWallComponentIds = (seedWallId: string): string[] => {
-    if (!floorPlanWalls.some((wall) => wall.id === seedWallId)) return [];
-
-    const adjacency = new Map<string, Set<string>>(
-      floorPlanWalls.map((wall) => [wall.id, new Set<string>()])
-    );
-    const connect = (a: string, b: string) => {
-      if (a === b) return;
-      adjacency.get(a)?.add(b);
-      adjacency.get(b)?.add(a);
-    };
-
-    // Connectivity is intentionally strict: the endpoint must already lie on the exact
-    // endpoint node or physical host face. This avoids grouping walls that are merely near.
-    const connectionToleranceMeters = 0.003;
-    for (const wall of floorPlanWalls) {
-      const start = { x: wall.x1Meters, y: wall.y1Meters };
-      const end = { x: wall.x2Meters, y: wall.y2Meters };
-      const startConnection = getCustomWallSnapTarget(
-        start,
-        end,
-        connectionToleranceMeters,
-        wall.id
-      );
-      const endConnection = getCustomWallSnapTarget(
-        end,
-        start,
-        connectionToleranceMeters,
-        wall.id
-      );
-      if (startConnection) connect(wall.id, startConnection.wallId);
-      if (endConnection) connect(wall.id, endConnection.wallId);
-    }
-
-    const visited = new Set<string>();
-    const queue = [seedWallId];
-    while (queue.length > 0) {
-      const current = queue.shift()!;
-      if (visited.has(current)) continue;
-      visited.add(current);
-      adjacency.get(current)?.forEach((neighbor) => {
-        if (!visited.has(neighbor)) queue.push(neighbor);
-      });
-    }
-    return Array.from(visited);
-  };
+  const getConnectedWallComponentIds = (seedWallId: string): string[] =>
+    getConnectedWallIds(wallGraph, seedWallId);
 
   const getRoomIdAtPoint = (point: { x: number; y: number }, tolerance = 0.03): string | undefined => {
     const candidates = roomsWithGeometry
@@ -1978,22 +1950,36 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
           label: `Parede ${floorPlanWalls.length + 1} (${dist.toFixed(2)}m)`,
         };
 
-        onUpdateProjectData({
-          ...projectData,
-          floorPlan: {
-            scalePixelsPerMeter: scalePxPerMeter,
-            gridSnapMeters,
-            symbols: floorPlanSymbols,
-            conduits: floorPlanConduits,
-            openings: floorPlanOpenings,
-            walls: [...floorPlanWalls, newWall],
-          },
+        const nextWalls = [...floorPlanWalls, newWall];
+        const nextCadAnalysis = analyzeWallNetwork(nextWalls, {
+          defaultThicknessMeters: wallThicknessMeters,
         });
-        setToolStatus(
-          sourceTopologyBefore
-            ? `Ramificação adicionada ao nó ${sourceNodeLabel}. O encontro agora possui ${sourceNodeBranchCount + 1} paredes no mesmo desenho.`
-            : 'Parede criada e conectividade da planta atualizada.'
+        const duplicateIssue = nextCadAnalysis.issues.find(
+          (issue) => issue.code === 'DUPLICATE' && issue.wallIds.includes(newWall.id)
         );
+
+        if (duplicateIssue) {
+          setToolStatus('Parede não criada: já existe uma parede exatamente sobre esse segmento.');
+        } else {
+          onUpdateProjectData({
+            ...projectData,
+            floorPlan: {
+              scalePixelsPerMeter: scalePxPerMeter,
+              gridSnapMeters,
+              symbols: floorPlanSymbols,
+              conduits: floorPlanConduits,
+              openings: floorPlanOpenings,
+              walls: nextWalls,
+            },
+          });
+          setToolStatus(
+            sourceTopologyBefore
+              ? `Ramificação adicionada ao nó ${sourceNodeLabel}. O encontro agora possui ${sourceNodeBranchCount + 1} paredes no mesmo desenho.`
+              : nextCadAnalysis.issues.length > 0
+                ? `Parede criada. CAD detectou ${nextCadAnalysis.issues.length} ponto(s) para revisão.`
+                : 'Parede criada e rede geométrica íntegra.'
+          );
+        }
       }
 
       finishHistoryTransaction();
@@ -2829,138 +2815,93 @@ function distToSegment(
   type EndpointNodeTopology = {
     point: { x: number; y: number };
     branches: EndpointNodeBranch[];
-    kind: 'single' | 'straight' | 'L' | 'T' | 'X' | 'multi';
+    kind: 'single' | 'straight' | 'L' | 'corner' | 'T' | 'Y' | 'X' | 'multi';
     throughPairs: [EndpointNodeBranch, EndpointNodeBranch][];
     stem?: EndpointNodeBranch;
   };
 
-  const getEndpointNodeTopology = (
-    point: { x: number; y: number },
-    epsilon = 1e-6
-  ): EndpointNodeTopology | null => {
+  const adaptCadNodeToEndpointTopology = (cadNode: WallGraphNode): EndpointNodeTopology | null => {
+    const branchMap = new Map<WallNodeBranch, EndpointNodeBranch>();
     const branches: EndpointNodeBranch[] = [];
 
-    for (const wall of floorPlanWalls) {
-      const startDistance = Math.hypot(point.x - wall.x1Meters, point.y - wall.y1Meters);
-      const endDistance = Math.hypot(point.x - wall.x2Meters, point.y - wall.y2Meters);
-      if (startDistance > epsilon && endDistance > epsilon) continue;
-
+    for (const cadBranch of cadNode.branches) {
+      const wall = floorPlanWalls.find((item) => item.id === cadBranch.wallId);
+      if (!wall) continue;
       const dx = wall.x2Meters - wall.x1Meters;
       const dy = wall.y2Meters - wall.y1Meters;
       const length = Math.hypot(dx, dy);
       if (length < 1e-9) continue;
-
       const storedUx = dx / length;
       const storedUy = dy / length;
-      const usesStart = startDistance <= endDistance;
-      const otherPoint = usesStart
-        ? { x: wall.x2Meters, y: wall.y2Meters }
-        : { x: wall.x1Meters, y: wall.y1Meters };
-      const awayDx = otherPoint.x - point.x;
-      const awayDy = otherPoint.y - point.y;
-      const awayLength = Math.hypot(awayDx, awayDy);
-      if (awayLength < 1e-9) continue;
-
-      branches.push({
+      const usesStart =
+        cadBranch.role === 'start'
+          ? true
+          : cadBranch.role === 'end'
+            ? false
+            : Math.hypot(cadBranch.anchor.x - wall.x1Meters, cadBranch.anchor.y - wall.y1Meters) <=
+              Math.hypot(cadBranch.anchor.x - wall.x2Meters, cadBranch.anchor.y - wall.y2Meters);
+      const adapted: EndpointNodeBranch = {
         wall,
         wallId: wall.id,
         usesStart,
-        awayUx: awayDx / awayLength,
-        awayUy: awayDy / awayLength,
+        awayUx: cadBranch.direction.x,
+        awayUy: cadBranch.direction.y,
         storedUx,
         storedUy,
         storedNx: -storedUy,
         storedNy: storedUx,
         halfMeters: (wall.thicknessMeters || wallThicknessMeters) / 2,
-      });
+      };
+      branchMap.set(cadBranch, adapted);
+      branches.push(adapted);
     }
 
     if (branches.length === 0) return null;
+    const throughPairs = cadNode.throughPairs
+      .map(([a, b]) => {
+        const aa = branchMap.get(a);
+        const bb = branchMap.get(b);
+        return aa && bb ? ([aa, bb] as [EndpointNodeBranch, EndpointNodeBranch]) : null;
+      })
+      .filter((pair): pair is [EndpointNodeBranch, EndpointNodeBranch] => Boolean(pair));
 
-    const dot = (a: EndpointNodeBranch, b: EndpointNodeBranch) =>
-      a.awayUx * b.awayUx + a.awayUy * b.awayUy;
-    const opposite = (a: EndpointNodeBranch, b: EndpointNodeBranch) => dot(a, b) <= -0.98;
-
-    if (branches.length === 1) {
-      return { point, branches, kind: 'single', throughPairs: [] };
+    const mappedKind: EndpointNodeTopology['kind'] =
+      cadNode.kind === 'end'
+        ? 'single'
+        : cadNode.kind;
+    let stem: EndpointNodeBranch | undefined;
+    if (mappedKind === 'T' && throughPairs[0]) {
+      const [a, b] = throughPairs[0];
+      stem = branches.find((branch) => branch !== a && branch !== b);
     }
 
-    if (branches.length === 2) {
-      return {
-        point,
-        branches,
-        kind: opposite(branches[0], branches[1]) ? 'straight' : 'L',
-        throughPairs: opposite(branches[0], branches[1]) ? [[branches[0], branches[1]]] : [],
-      };
-    }
-
-    const candidates: Array<{
-      a: EndpointNodeBranch;
-      b: EndpointNodeBranch;
-      score: number;
-    }> = [];
-    for (let i = 0; i < branches.length; i += 1) {
-      for (let j = i + 1; j < branches.length; j += 1) {
-        if (!opposite(branches[i], branches[j])) continue;
-        candidates.push({ a: branches[i], b: branches[j], score: dot(branches[i], branches[j]) });
-      }
-    }
-    candidates.sort((a, b) => a.score - b.score);
-
-    // Keep straight-through axes for nodes of any degree (+, *, etc.). Each branch can
-    // participate in at most one opposite pair.
-    const throughPairs: [EndpointNodeBranch, EndpointNodeBranch][] = [];
-    const pairedWallIds = new Set<string>();
-    for (const candidate of candidates) {
-      if (pairedWallIds.has(candidate.a.wallId) || pairedWallIds.has(candidate.b.wallId)) continue;
-      throughPairs.push([candidate.a, candidate.b]);
-      pairedWallIds.add(candidate.a.wallId);
-      pairedWallIds.add(candidate.b.wallId);
-    }
-
-    if (branches.length === 3 && throughPairs.length > 0) {
-      const pair = throughPairs[0];
-      const stem = branches.find((branch) => branch.wallId !== pair[0].wallId && branch.wallId !== pair[1].wallId);
-      if (stem) {
-        return {
-          point,
-          branches,
-          kind: 'T',
-          throughPairs: [pair],
-          stem,
-        };
-      }
-    }
-
-    if (branches.length === 4 && throughPairs.length === 2) {
-      return {
-        point,
-        branches,
-        kind: 'X',
-        throughPairs,
-      };
-    }
-
-    return { point, branches, kind: 'multi', throughPairs };
+    return {
+      point: { ...cadNode.point },
+      branches,
+      kind: mappedKind,
+      throughPairs,
+      stem,
+    };
   };
 
-  const getUniqueCustomEndpointNodeTopologies = (): EndpointNodeTopology[] => {
-    const points: { x: number; y: number }[] = [];
-    const epsilon = 1e-6;
-    for (const wall of floorPlanWalls) {
-      for (const point of [
-        { x: wall.x1Meters, y: wall.y1Meters },
-        { x: wall.x2Meters, y: wall.y2Meters },
-      ]) {
-        if (!points.some((candidate) => Math.hypot(candidate.x - point.x, candidate.y - point.y) <= epsilon)) {
-          points.push(point);
-        }
-      }
-    }
-    return points
-      .map((point) => getEndpointNodeTopology(point, epsilon))
-      .filter((topology): topology is EndpointNodeTopology => Boolean(topology && topology.branches.length >= 2));
+  const getEndpointNodeTopology = (
+    point: { x: number; y: number },
+    epsilon = 0.004
+  ): EndpointNodeTopology | null => {
+    const direct = findWallNodeNearPoint(wallGraph, point, epsilon);
+    const cadNode = direct || wallGraph.nodes.find((node) =>
+      node.branches.some((branch) =>
+        Math.hypot(branch.anchor.x - point.x, branch.anchor.y - point.y) <= epsilon
+      )
+    ) || null;
+    return cadNode ? adaptCadNodeToEndpointTopology(cadNode) : null;
   };
+
+  const getUniqueCustomEndpointNodeTopologies = (): EndpointNodeTopology[] =>
+    wallGraph.nodes
+      .filter((node) => node.wallIds.length >= 2)
+      .map(adaptCadNodeToEndpointTopology)
+      .filter((topology): topology is EndpointNodeTopology => Boolean(topology));
 
   // Multi-branch nodes are solved as one topology, not as several independent L corners.
   // At a T, the straight pair is the host and the third branch terminates exactly on the
@@ -2978,12 +2919,12 @@ function distToSegment(
 
     const basePoints = {
       positive: {
-        x: point.x + branch.storedNx * branch.halfMeters,
-        y: point.y + branch.storedNy * branch.halfMeters,
+        x: topology.point.x + branch.storedNx * branch.halfMeters,
+        y: topology.point.y + branch.storedNy * branch.halfMeters,
       },
       negative: {
-        x: point.x - branch.storedNx * branch.halfMeters,
-        y: point.y - branch.storedNy * branch.halfMeters,
+        x: topology.point.x - branch.storedNx * branch.halfMeters,
+        y: topology.point.y - branch.storedNy * branch.halfMeters,
       },
     };
 
@@ -3000,14 +2941,14 @@ function distToSegment(
     const hostHalf = Math.max(hostPair[0].halfMeters, hostPair[1].halfMeters);
     const side = topology.stem.awayUx * hostNx + topology.stem.awayUy * hostNy >= 0 ? 1 : -1;
     const hostFacePoint = {
-      x: point.x + hostNx * hostHalf * side,
-      y: point.y + hostNy * hostHalf * side,
+      x: topology.point.x + hostNx * hostHalf * side,
+      y: topology.point.y + hostNy * hostHalf * side,
     };
 
     const intersectStoredFace = (normalSign: 1 | -1) => {
       const sideOrigin = {
-        x: point.x + branch.storedNx * branch.halfMeters * normalSign,
-        y: point.y + branch.storedNy * branch.halfMeters * normalSign,
+        x: topology.point.x + branch.storedNx * branch.halfMeters * normalSign,
+        y: topology.point.y + branch.storedNy * branch.halfMeters * normalSign,
       };
       const cross = branch.storedUx * hostUy - branch.storedUy * hostUx;
       if (Math.abs(cross) < 1e-8) return normalSign === 1 ? basePoints.positive : basePoints.negative;
@@ -3517,6 +3458,22 @@ function distToSegment(
                 <option value={0.15}>15 cm (Padrão)</option>
                 <option value={0.20}>20 cm (Externa / Estrutural)</option>
               </select>
+            </div>
+            <div
+              className={`border px-2 py-1 font-black ${
+                wallCadAnalysis.issues.length === 0
+                  ? 'border-emerald-700 bg-emerald-50 text-emerald-800'
+                  : 'border-amber-600 bg-amber-50 text-amber-900'
+              }`}
+              title={
+                wallCadAnalysis.issues.length === 0
+                  ? 'A rede de paredes não possui erros geométricos detectados.'
+                  : wallCadAnalysis.issues.map((issue) => issue.message).join(' • ')
+              }
+            >
+              CAD: {wallGraph.nodes.filter((node) => node.wallIds.length >= 2).length} nós •{' '}
+              {wallCadAnalysis.componentCount} rede(s) •{' '}
+              {wallCadAnalysis.issues.length === 0 ? 'íntegro' : `${wallCadAnalysis.issues.length} alerta(s)`}
             </div>
             <span className="text-[11px] font-bold text-blue-900">
               * Clique em qualquer canto do cômodo ou ponto no canvas e arraste para desenhar uma parede com linhas duplas e hachura!
@@ -4482,6 +4439,37 @@ function distToSegment(
                       </g>
                     );
                   })}
+
+              {/* CAD geometry diagnostics. These markers are editor-only and never alter model dimensions. */}
+              {activeTool === 'draw_wall' && wallCadAnalysis.issues.map((issue, index) => {
+                if (!issue.point) return null;
+                const cx = issue.point.x * scalePxPerMeter;
+                const cy = issue.point.y * scalePxPerMeter;
+                return (
+                  <g key={`cad-issue-${issue.code}-${index}`} pointerEvents="none">
+                    <circle
+                      cx={cx}
+                      cy={cy}
+                      r="9"
+                      fill="#fef3c7"
+                      stroke="#d97706"
+                      strokeWidth="2"
+                      strokeDasharray="3 2"
+                    />
+                    <text
+                      x={cx}
+                      y={cy + 3}
+                      textAnchor="middle"
+                      fontSize="9"
+                      fontWeight="black"
+                      fill="#92400e"
+                    >
+                      !
+                    </text>
+                    <title>{issue.message}</title>
+                  </g>
+                );
+              })}
 
               {/* Interactive Custom Walls */}
               {floorPlanWalls.map((w) => {
