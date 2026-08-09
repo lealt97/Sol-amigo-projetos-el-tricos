@@ -24,6 +24,23 @@ jobs:
         with:
           node-version: 22
 
+      - name: Fix temporary patch typing
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('scripts/migrate-centerline-topology.py')
+          text = p.read_text()
+          text = text.replace(
+            "const migratedWallById = new Map(migratedWalls.map((wall) => [wall.id, wall] as const));",
+            "const migratedWallById = new Map<string, FloorPlanWall>(migratedWalls.map((wall) => [wall.id, wall] as const));"
+          )
+          text = text.replace(
+            "const previousWallById = new Map(floorPlanWalls.map((wall) => [wall.id, wall] as const));",
+            "const previousWallById = new Map<string, FloorPlanWall>(floorPlanWalls.map((wall) => [wall.id, wall] as const));"
+          )
+          p.write_text(text)
+          PY
+
       - name: Apply canonical centerline topology
         run: python scripts/migrate-centerline-topology.py
 
