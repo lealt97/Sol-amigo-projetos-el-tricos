@@ -54,12 +54,13 @@ replace_once(
     );
     if (!cadNode) return [{ wallId, handle }];
 
-    const linked = cadNode.branches.flatMap((branch) => {
+    const linked: { wallId: string; handle: 'p1' | 'p2' }[] = cadNode.branches.flatMap((branch) => {
       if (branch.role === 'start') return [{ wallId: branch.wallId, handle: 'p1' as const }];
       if (branch.role === 'end') return [{ wallId: branch.wallId, handle: 'p2' as const }];
       return [];
     });
-    const unique = new Map(linked.map((item) => [`${item.wallId}:${item.handle}`, item] as const));
+    const unique = new Map<string, { wallId: string; handle: 'p1' | 'p2' }>();
+    linked.forEach((item) => unique.set(`${item.wallId}:${item.handle}`, item));
     return unique.size > 0 ? Array.from(unique.values()) : [{ wallId, handle }];
   };
 """,
