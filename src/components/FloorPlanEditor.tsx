@@ -55,6 +55,10 @@ import {
   getWallSelectionBounds,
   translateWallSelection,
   rotateWallSelection,
+  rotatePointAround,
+  isPointInsidePolygon,
+  trimWallEndpointToNearestNode,
+  extendWallEndpointToNearestWall,
   offsetWallCenterline,
   setWallEndByLengthAngle,
   type WallGraphNode,
@@ -1506,6 +1510,9 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
     const componentOpenings = floorPlanOpenings
       .filter((opening) => Boolean(opening.wallId && componentIdSet.has(opening.wallId)))
       .map((opening) => ({ ...opening }));
+    const componentSymbols = wall.roomId
+      ? []
+      : getSymbolsInsideWallNetwork(effectiveIds).map((symbol) => ({ ...symbol }));
 
     if (!wall.roomId && componentWalls.length > 1) {
       setSelectedWallIds(componentWalls.map((item) => item.id));
@@ -1517,6 +1524,7 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
       wall: { ...wall },
       childWalls: componentWalls,
       childOpenings: componentOpenings,
+      childSymbols: componentSymbols,
     });
     setToolStatus(
       !wall.roomId && componentWalls.length > 1
@@ -1930,6 +1938,9 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
         const openingOrigins = new Map<string, FloorPlanOpening>(
           (elementDrag.childOpenings || []).map((item) => [item.id, item] as const)
         );
+        const symbolOrigins = new Map<string, FloorPlanSymbol>(
+          (elementDrag.childSymbols || []).map((item) => [item.id, item] as const)
+        );
         const minOriginX = Math.min(
           ...dragWalls.flatMap((item) => [item.x1Meters, item.x2Meters])
         );
@@ -1961,6 +1972,16 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
               }
             : opening;
         });
+        const updatedSymbols = floorPlanSymbols.map((symbol) => {
+          const original = symbolOrigins.get(symbol.id);
+          return original
+            ? {
+                ...symbol,
+                xMeters: original.xMeters + appliedX,
+                yMeters: original.yMeters + appliedY,
+              }
+            : symbol;
+        });
 
         onUpdateProjectData({
           ...projectData,
@@ -1968,7 +1989,7 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
             ...baseFloorPlan,
             scalePixelsPerMeter: scalePxPerMeter,
             gridSnapMeters,
-            symbols: floorPlanSymbols,
+            symbols: updatedSymbols,
             conduits: floorPlanConduits,
             openings: updatedOpenings,
             walls: updatedWalls,
@@ -3104,7 +3125,58 @@ function distToSegment(
     return Array.from(ids);
   };
 
-  const commitWallGeometryEdit = (walls: FloorPlanWall[], message: string) => {
+  const getWallNetworkFaces = (wallIds: Iterable<string>) => {
+    const ids = new Set(wallIds);
+    return closedWallFaces.filter((face) =>
+      face.wallIds.length > 0 && face.wallIds.every((wallId) => ids.has(wallId))
+    );
+  };
+
+  const getSymbolsInsideWallNetwork = (wallIds: Iterable<string>): FloorPlanSymbol[] => {
+    const faces = getWallNetworkFaces(wallIds);
+    if (faces.length === 0) return [];
+    return floorPlanSymbols.filter((symbol) =>
+      faces.some((face) => isPointInsidePolygon(
+        { x: symbol.xMeters, y: symbol.yMeters },
+        face.axisPoints,
+        1e-6
+      ))
+    );
+  };
+
+  const preserveOpeningPositionsForWallChange = (
+    nextWalls: FloorPlanWall[],
+    changedWallIds: Iterable<string>
+  ): FloorPlanOpening[] => {
+    const ids = new Set(changedWallIds);
+    const previousById = new Map<string, FloorPlanWall>(floorPlanWalls.map((wall) => [wall.id, wall] as const));
+    const nextById = new Map<string, FloorPlanWall>(nextWalls.map((wall) => [wall.id, wall] as const));
+    return floorPlanOpenings.map((opening) => {
+      if (!opening.wallId || !ids.has(opening.wallId)) return opening;
+      const previous = previousById.get(opening.wallId);
+      const next = nextById.get(opening.wallId);
+      if (!previous || !next) return opening;
+      const oldRatio = Math.max(0, Math.min(1, opening.wallPositionRatio ?? 0.5));
+      const oldCenter = {
+        x: previous.x1Meters + (previous.x2Meters - previous.x1Meters) * oldRatio,
+        y: previous.y1Meters + (previous.y2Meters - previous.y1Meters) * oldRatio,
+      };
+      const dx = next.x2Meters - next.x1Meters;
+      const dy = next.y2Meters - next.y1Meters;
+      const lengthSq = dx * dx + dy * dy;
+      if (lengthSq < 1e-9) return opening;
+      const nextRatio = Math.max(0, Math.min(1,
+        ((oldCenter.x - next.x1Meters) * dx + (oldCenter.y - next.y1Meters) * dy) / lengthSq
+      ));
+      return { ...opening, wallPositionRatio: nextRatio };
+    });
+  };
+
+  const commitWallGeometryEdit = (
+    walls: FloorPlanWall[],
+    message: string,
+    options?: { symbols?: FloorPlanSymbol[]; openings?: FloorPlanOpening[] }
+  ) => {
     const canonical = canonicalizeWallCenterlineTopology(walls, {
       defaultThicknessMeters: wallThicknessMeters,
     });
@@ -3119,9 +3191,9 @@ function distToSegment(
       floorPlan: {
         scalePixelsPerMeter: scalePxPerMeter,
         gridSnapMeters,
-        symbols: floorPlanSymbols,
+        symbols: options?.symbols || floorPlanSymbols,
         conduits: floorPlanConduits,
-        openings: floorPlanOpenings,
+        openings: options?.openings || floorPlanOpenings,
         walls: canonical,
       },
     });
@@ -3139,7 +3211,17 @@ function distToSegment(
     const ids = getSelectedConnectedWallIds();
     if (ids.length === 0) return;
     const moved = translateWallSelection(floorPlanWalls, ids, dx, dy);
-    if (commitWallGeometryEdit(moved, `Rede movida exatamente ΔX=${dx.toFixed(3)} m • ΔY=${dy.toFixed(3)} m.`)) {
+    const spatialSymbolIds = new Set(getSymbolsInsideWallNetwork(ids).map((symbol) => symbol.id));
+    const movedSymbols = floorPlanSymbols.map((symbol) =>
+      spatialSymbolIds.has(symbol.id)
+        ? { ...symbol, xMeters: symbol.xMeters + dx, yMeters: symbol.yMeters + dy }
+        : symbol
+    );
+    if (commitWallGeometryEdit(
+      moved,
+      `Rede movida exatamente ΔX=${dx.toFixed(3)} m • ΔY=${dy.toFixed(3)} m. ${spatialSymbolIds.size} símbolo(s) interno(s) acompanharam.`,
+      { symbols: movedSymbols }
+    )) {
       setSelectedWallIds(ids);
     }
   };
@@ -3155,7 +3237,17 @@ function distToSegment(
     const bounds = getWallSelectionBounds(floorPlanWalls, ids);
     if (!bounds) return;
     const rotated = rotateWallSelection(floorPlanWalls, ids, angle, bounds.center);
-    if (commitWallGeometryEdit(rotated, `Rede girada ${angle.toFixed(2)}° em torno do centro da seleção.`)) {
+    const spatialSymbolIds = new Set(getSymbolsInsideWallNetwork(ids).map((symbol) => symbol.id));
+    const rotatedSymbols = floorPlanSymbols.map((symbol) => {
+      if (!spatialSymbolIds.has(symbol.id)) return symbol;
+      const point = rotatePointAround({ x: symbol.xMeters, y: symbol.yMeters }, bounds.center, angle);
+      return { ...symbol, xMeters: point.x, yMeters: point.y };
+    });
+    if (commitWallGeometryEdit(
+      rotated,
+      `Rede girada ${angle.toFixed(2)}° em torno do centro da seleção. ${spatialSymbolIds.size} símbolo(s) interno(s) acompanharam.`,
+      { symbols: rotatedSymbols }
+    )) {
       setSelectedWallIds(ids);
     }
   };
@@ -3188,6 +3280,46 @@ function distToSegment(
     if (commitWallGeometryEdit(
       editedWalls,
       `Parede ajustada para ${length.toFixed(3)} m • ${(((angle % 360) + 360) % 360).toFixed(2)}°. Nó final preservado.`
+    )) {
+      setSelectedWallIds([wall.id]);
+    }
+  };
+
+  const trimSelectedWallEndpoint = (handle: 'p1' | 'p2') => {
+    if (!selectedWallId) return;
+    const wall = floorPlanWalls.find((item) => item.id === selectedWallId);
+    if (!wall) return;
+    const result = trimWallEndpointToNearestNode(wall, handle, wallGraph);
+    if (!result) {
+      setToolStatus(`APARAR ${handle.toUpperCase()}: não existe nó/interseção interna nesse segmento.`);
+      return;
+    }
+    const nextWalls = floorPlanWalls.map((item) => item.id === wall.id ? result.wall : item);
+    const nextOpenings = preserveOpeningPositionsForWallChange(nextWalls, [wall.id]);
+    if (commitWallGeometryEdit(
+      nextWalls,
+      `APARAR ${handle.toUpperCase()}: ${result.distanceMeters.toFixed(3)} m removidos até o nó mais próximo.`,
+      { openings: nextOpenings }
+    )) {
+      setSelectedWallIds([wall.id]);
+    }
+  };
+
+  const extendSelectedWallEndpoint = (handle: 'p1' | 'p2') => {
+    if (!selectedWallId) return;
+    const wall = floorPlanWalls.find((item) => item.id === selectedWallId);
+    if (!wall) return;
+    const result = extendWallEndpointToNearestWall(wall, handle, floorPlanWalls);
+    if (!result) {
+      setToolStatus(`ESTENDER ${handle.toUpperCase()}: nenhuma parede foi encontrada à frente do endpoint.`);
+      return;
+    }
+    const nextWalls = floorPlanWalls.map((item) => item.id === wall.id ? result.wall : item);
+    const nextOpenings = preserveOpeningPositionsForWallChange(nextWalls, [wall.id]);
+    if (commitWallGeometryEdit(
+      nextWalls,
+      `ESTENDER ${handle.toUpperCase()}: +${result.distanceMeters.toFixed(3)} m até ${result.targetWallId || 'parede alvo'}.`,
+      { openings: nextOpenings }
     )) {
       setSelectedWallIds([wall.id]);
     }
@@ -3833,6 +3965,15 @@ function distToSegment(
                 </button>
               </div>
 
+              <div className="flex items-center gap-1 border-l border-slate-400 pl-3">
+                <span className="font-bold">APARAR</span>
+                <button onClick={() => trimSelectedWallEndpoint('p1')} className="border border-[#141414] bg-white px-2 py-1 font-black hover:bg-[#141414] hover:text-white">P1</button>
+                <button onClick={() => trimSelectedWallEndpoint('p2')} className="border border-[#141414] bg-white px-2 py-1 font-black hover:bg-[#141414] hover:text-white">P2</button>
+                <span className="font-bold ml-1">ESTENDER</span>
+                <button onClick={() => extendSelectedWallEndpoint('p1')} className="border border-[#141414] bg-white px-2 py-1 font-black hover:bg-[#141414] hover:text-white">P1</button>
+                <button onClick={() => extendSelectedWallEndpoint('p2')} className="border border-[#141414] bg-white px-2 py-1 font-black hover:bg-[#141414] hover:text-white">P2</button>
+              </div>
+
               <select
                 value={wall.thicknessMeters || wallThicknessMeters}
                 onChange={(e) => setSelectedWallThicknessExact(Number(e.target.value))}
@@ -3853,7 +3994,7 @@ function distToSegment(
                 <button onClick={() => offsetSelectedWall(1)} className="border border-[#141414] bg-white px-2 py-1 font-black hover:bg-[#141414] hover:text-white">+ lado</button>
               </div>
               <span className="text-[10px] font-bold text-slate-600">
-                Mover/Girar transforma a planta conectada inteira. Comprimento/ângulo move o nó final compartilhado. OFFSET cria uma parede paralela independente.
+                Mover/Girar transforma a planta conectada inteira e leva símbolos internos. Comprimento/ângulo preserva o nó final. APARAR usa o nó interno mais próximo; ESTENDER busca a primeira parede à frente. OFFSET cria uma parede paralela independente.
               </span>
             </div>
           );
