@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import type { FloorPlanWall } from '../src/types';
 import {
   analyzeWallNetwork,
+  canonicalizeWallCenterlineTopology,
   applyWallPrecisionConstraints,
   buildWallGraph,
   findClosedWallPerimeters,
@@ -237,6 +238,45 @@ const nodeAt = (walls: FloorPlanWall[], x: number, y: number, radius = 0.004) =>
   assert.equal(findClosedWallFaces(walls).length, 0);
 }
 
-console.log('wall-cad-regression: 17 cenários críticos passaram');
+
+// 18) T legado salvo na face física é migrado para o eixo lógico da hospedeira.
+{
+  const walls = [
+    wall('host', 0, 0, 4, 0, 0.20),
+    wall('stem', 2, 0.10, 2, 2, 0.10),
+  ];
+  const canonical = canonicalizeWallCenterlineTopology(walls);
+  const stem = canonical.find((item) => item.id === 'stem')!;
+  assert.ok(Math.abs(stem.x1Meters - 2) < 1e-9);
+  assert.ok(Math.abs(stem.y1Meters - 0) < 1e-9);
+  const node = findWallNodeNearPoint(buildWallGraph(canonical), { x: 2, y: 0 }, 0.004);
+  assert.equal(node?.kind, 'T');
+}
+
+// 19) Nó compartilhado ligeiramente desalinhado dentro da tolerância converge para um ponto único.
+{
+  const walls = [
+    wall('a', 0, 0, 2, 0),
+    wall('b', 2.001, 0.001, 2.001, 2),
+  ];
+  const canonical = canonicalizeWallCenterlineTopology(walls);
+  const a = canonical.find((item) => item.id === 'a')!;
+  const b = canonical.find((item) => item.id === 'b')!;
+  assert.ok(Math.hypot(a.x2Meters - b.x1Meters, a.y2Meters - b.y1Meters) < 1e-9);
+}
+
+// 20) Canonização é idempotente e não altera uma topologia já canônica.
+{
+  const walls = [
+    wall('host', 0, 0, 4, 0),
+    wall('stem', 2, 0, 2, 2),
+  ];
+  const once = canonicalizeWallCenterlineTopology(walls);
+  const twice = canonicalizeWallCenterlineTopology(once);
+  assert.deepEqual(twice, once);
+}
+
+console.log('wall-cad-regression: 20 cenários críticos passaram');
+
 
 
