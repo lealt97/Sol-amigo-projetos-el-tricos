@@ -89,6 +89,9 @@ export interface FloorPlanWall {
   y2Meters: number;
   thicknessMeters?: number;
   roomId?: string;
+  // Stable architectural assembly id. Every geometrically connected wall component
+  // belongs to one group, even when the drawing was made only with Draw Wall.
+  groupId?: string;
   label?: string;
 }
 
