@@ -52,6 +52,11 @@ import {
   findClosedWallFaces,
   findWallNodeNearPoint,
   getConnectedWallIds,
+  getWallSelectionBounds,
+  translateWallSelection,
+  rotateWallSelection,
+  offsetWallCenterline,
+  setWallEndByLengthAngle,
   type WallGraphNode,
   type WallNodeBranch,
 } from '../utils/wallCadEngine';
@@ -143,6 +148,12 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
   const [selectedSymbolIds, setSelectedSymbolIds] = useState<string[]>([]);
   const [selectedOpeningIds, setSelectedOpeningIds] = useState<string[]>([]);
   const [selectedWallIds, setSelectedWallIds] = useState<string[]>([]);
+  const [editMoveXInput, setEditMoveXInput] = useState('0');
+  const [editMoveYInput, setEditMoveYInput] = useState('0');
+  const [editRotateInput, setEditRotateInput] = useState('90');
+  const [editOffsetInput, setEditOffsetInput] = useState('0.15');
+  const [editWallLengthInput, setEditWallLengthInput] = useState('');
+  const [editWallAngleInput, setEditWallAngleInput] = useState('');
 
   // Click & Drag Box Selection State
   const [isBoxSelecting, setIsBoxSelecting] = useState(false);
@@ -3078,6 +3089,146 @@ function distToSegment(
     return unique.size > 0 ? Array.from(unique.values()) : [{ wallId, handle }];
   };
 
+  const parseSignedCadNumber = (value: string): number | null => {
+    if (!value.trim()) return null;
+    const parsed = Number(value.replace(',', '.'));
+    return Number.isFinite(parsed) ? parsed : null;
+  };
+
+  const getSelectedConnectedWallIds = (): string[] => {
+    const ids = new Set<string>();
+    selectedWallIds.forEach((wallId) => {
+      const component = getConnectedWallIds(wallGraph, wallId);
+      (component.length > 0 ? component : [wallId]).forEach((id) => ids.add(id));
+    });
+    return Array.from(ids);
+  };
+
+  const commitWallGeometryEdit = (walls: FloorPlanWall[], message: string) => {
+    const canonical = canonicalizeWallCenterlineTopology(walls, {
+      defaultThicknessMeters: wallThicknessMeters,
+    });
+    const analysis = analyzeWallNetwork(canonical, { defaultThicknessMeters: wallThicknessMeters });
+    const hardIssue = analysis.issues.find((issue) => issue.code === 'ZERO_LENGTH' || issue.code === 'DUPLICATE');
+    if (hardIssue) {
+      setToolStatus(`Edição rejeitada: ${hardIssue.message}`);
+      return false;
+    }
+    onUpdateProjectData({
+      ...projectData,
+      floorPlan: {
+        scalePixelsPerMeter: scalePxPerMeter,
+        gridSnapMeters,
+        symbols: floorPlanSymbols,
+        conduits: floorPlanConduits,
+        openings: floorPlanOpenings,
+        walls: canonical,
+      },
+    });
+    setToolStatus(message);
+    return true;
+  };
+
+  const moveSelectedWallNetworkExact = () => {
+    const dx = parseSignedCadNumber(editMoveXInput);
+    const dy = parseSignedCadNumber(editMoveYInput);
+    if (dx === null || dy === null) {
+      setToolStatus('Mover exato: informe ΔX e ΔY válidos em metros.');
+      return;
+    }
+    const ids = getSelectedConnectedWallIds();
+    if (ids.length === 0) return;
+    const moved = translateWallSelection(floorPlanWalls, ids, dx, dy);
+    if (commitWallGeometryEdit(moved, `Rede movida exatamente ΔX=${dx.toFixed(3)} m • ΔY=${dy.toFixed(3)} m.`)) {
+      setSelectedWallIds(ids);
+    }
+  };
+
+  const rotateSelectedWallNetworkExact = () => {
+    const angle = parseSignedCadNumber(editRotateInput);
+    if (angle === null) {
+      setToolStatus('Rotação: informe um ângulo válido em graus.');
+      return;
+    }
+    const ids = getSelectedConnectedWallIds();
+    if (ids.length === 0) return;
+    const bounds = getWallSelectionBounds(floorPlanWalls, ids);
+    if (!bounds) return;
+    const rotated = rotateWallSelection(floorPlanWalls, ids, angle, bounds.center);
+    if (commitWallGeometryEdit(rotated, `Rede girada ${angle.toFixed(2)}° em torno do centro da seleção.`)) {
+      setSelectedWallIds(ids);
+    }
+  };
+
+  const applySelectedWallExactGeometry = () => {
+    if (!selectedWallId) return;
+    const wall = floorPlanWalls.find((item) => item.id === selectedWallId);
+    if (!wall) return;
+    const currentDx = wall.x2Meters - wall.x1Meters;
+    const currentDy = wall.y2Meters - wall.y1Meters;
+    const currentLength = Math.hypot(currentDx, currentDy);
+    const currentAngle = ((Math.atan2(-currentDy, currentDx) * 180) / Math.PI + 360) % 360;
+    const length = editWallLengthInput.trim() ? parsePositiveCadNumber(editWallLengthInput) : currentLength;
+    const angle = editWallAngleInput.trim() ? parseCadAngle(editWallAngleInput) : currentAngle;
+    if (length === null || angle === null) {
+      setToolStatus('Geometria exata: comprimento/ângulo inválidos.');
+      return;
+    }
+    const editedWall = setWallEndByLengthAngle(wall, length, angle);
+    const linked = getLinkedEndpointHandles(wall.id, 'p2');
+    const nextPoint = { x: editedWall.x2Meters, y: editedWall.y2Meters };
+    const linkedByWall = new Map<string, 'p1' | 'p2'>(linked.map((item) => [item.wallId, item.handle] as const));
+    const editedWalls = floorPlanWalls.map((item) => {
+      const handle = linkedByWall.get(item.id);
+      if (!handle) return item;
+      return handle === 'p1'
+        ? { ...item, x1Meters: nextPoint.x, y1Meters: nextPoint.y }
+        : { ...item, x2Meters: nextPoint.x, y2Meters: nextPoint.y };
+    });
+    if (commitWallGeometryEdit(
+      editedWalls,
+      `Parede ajustada para ${length.toFixed(3)} m • ${(((angle % 360) + 360) % 360).toFixed(2)}°. Nó final preservado.`
+    )) {
+      setSelectedWallIds([wall.id]);
+    }
+  };
+
+  const setSelectedWallThicknessExact = (thicknessMeters: number) => {
+    if (!selectedWallId || !Number.isFinite(thicknessMeters) || thicknessMeters <= 0) return;
+    const edited = floorPlanWalls.map((wall) =>
+      wall.id === selectedWallId ? { ...wall, thicknessMeters } : wall
+    );
+    if (commitWallGeometryEdit(edited, `Espessura da parede: ${(thicknessMeters * 100).toFixed(0)} cm.`)) {
+      setSelectedWallIds([selectedWallId]);
+    }
+  };
+
+  const offsetSelectedWall = (side: 1 | -1) => {
+    if (!selectedWallId) return;
+    const source = floorPlanWalls.find((wall) => wall.id === selectedWallId);
+    const distanceMeters = parsePositiveCadNumber(editOffsetInput);
+    if (!source || distanceMeters === null) {
+      setToolStatus('OFFSET: selecione uma parede e informe uma distância positiva.');
+      return;
+    }
+    const offset = offsetWallCenterline(source, distanceMeters * side);
+    if (!offset) return;
+    const timestamp = Date.now();
+    const newWall: FloorPlanWall = {
+      ...offset,
+      id: `wall_offset_${timestamp}`,
+      roomId: undefined,
+      groupId: `wallgrp_wall_offset_${timestamp}`,
+      label: `${source.label || 'Parede'} • offset ${distanceMeters.toFixed(3)}m`,
+    };
+    if (commitWallGeometryEdit(
+      [...floorPlanWalls, newWall],
+      `OFFSET ${side > 0 ? '+' : '−'}${distanceMeters.toFixed(3)} m criado paralelo à parede.`
+    )) {
+      setSelectedWallIds([newWall.id]);
+    }
+  };
+
   // Multi-branch nodes are solved as one topology, not as several independent L corners.
   // At a T, the straight pair is the host and the third branch terminates exactly on the
   // contacted host face. At an X, every branch stops at the shared center node and seam
@@ -3633,6 +3784,80 @@ function distToSegment(
         </div>
 
         {/* Dynamic Tool Option Panels */}
+        {activeTool === 'select' && selectedWallId && (() => {
+          const wall = floorPlanWalls.find((item) => item.id === selectedWallId);
+          if (!wall) return null;
+          const dx = wall.x2Meters - wall.x1Meters;
+          const dy = wall.y2Meters - wall.y1Meters;
+          const length = Math.hypot(dx, dy);
+          const angle = ((Math.atan2(-dy, dx) * 180) / Math.PI + 360) % 360;
+          const networkIds = getSelectedConnectedWallIds();
+          return (
+            <div className="border border-[#141414] bg-slate-50 p-2.5 flex flex-wrap items-center gap-3 text-xs">
+              <span className="font-black uppercase">Editar CAD:</span>
+              <div className="border border-[#141414] bg-white px-2 py-1 font-mono font-bold">
+                Segmento {length.toFixed(3)} m • {angle.toFixed(2)}° • {(wall.thicknessMeters || wallThicknessMeters) * 100} cm
+              </div>
+              <div className="border border-blue-700 bg-blue-50 text-blue-900 px-2 py-1 font-bold">
+                Rede conectada: {networkIds.length} parede(s)
+              </div>
+
+              <div className="flex items-center gap-1 border-l border-slate-400 pl-3">
+                <label className="font-bold">ΔX</label>
+                <input value={editMoveXInput} onChange={(e) => setEditMoveXInput(e.target.value)} className="w-16 border border-[#141414] px-1 py-1 font-mono" />
+                <label className="font-bold">ΔY</label>
+                <input value={editMoveYInput} onChange={(e) => setEditMoveYInput(e.target.value)} className="w-16 border border-[#141414] px-1 py-1 font-mono" />
+                <button onClick={moveSelectedWallNetworkExact} className="border border-[#141414] bg-white px-2 py-1 font-black hover:bg-[#141414] hover:text-white">
+                  MOVER REDE
+                </button>
+              </div>
+
+              <div className="flex items-center gap-1">
+                <label className="font-bold">Girar</label>
+                <input value={editRotateInput} onChange={(e) => setEditRotateInput(e.target.value)} className="w-16 border border-[#141414] px-1 py-1 font-mono" />
+                <span>°</span>
+                <button onClick={rotateSelectedWallNetworkExact} className="border border-[#141414] bg-white px-2 py-1 font-black hover:bg-[#141414] hover:text-white">
+                  GIRAR REDE
+                </button>
+              </div>
+
+              <div className="flex items-center gap-1 border-l border-slate-400 pl-3">
+                <label className="font-bold">L</label>
+                <input value={editWallLengthInput} onChange={(e) => setEditWallLengthInput(e.target.value)} placeholder={length.toFixed(3)} className="w-20 border border-[#141414] px-1 py-1 font-mono" />
+                <span>m</span>
+                <label className="font-bold">A</label>
+                <input value={editWallAngleInput} onChange={(e) => setEditWallAngleInput(e.target.value)} placeholder={angle.toFixed(2)} className="w-20 border border-[#141414] px-1 py-1 font-mono" />
+                <span>°</span>
+                <button onClick={applySelectedWallExactGeometry} className="border border-[#141414] bg-white px-2 py-1 font-black hover:bg-[#141414] hover:text-white">
+                  APLICAR SEGMENTO
+                </button>
+              </div>
+
+              <select
+                value={wall.thicknessMeters || wallThicknessMeters}
+                onChange={(e) => setSelectedWallThicknessExact(Number(e.target.value))}
+                className="border border-[#141414] bg-white px-2 py-1 font-bold"
+                title="Espessura do segmento selecionado"
+              >
+                <option value={0.10}>10 cm</option>
+                <option value={0.15}>15 cm</option>
+                <option value={0.20}>20 cm</option>
+                <option value={0.25}>25 cm</option>
+              </select>
+
+              <div className="flex items-center gap-1 border-l border-slate-400 pl-3">
+                <label className="font-bold">OFFSET</label>
+                <input value={editOffsetInput} onChange={(e) => setEditOffsetInput(e.target.value)} className="w-16 border border-[#141414] px-1 py-1 font-mono" />
+                <span>m</span>
+                <button onClick={() => offsetSelectedWall(-1)} className="border border-[#141414] bg-white px-2 py-1 font-black hover:bg-[#141414] hover:text-white">− lado</button>
+                <button onClick={() => offsetSelectedWall(1)} className="border border-[#141414] bg-white px-2 py-1 font-black hover:bg-[#141414] hover:text-white">+ lado</button>
+              </div>
+              <span className="text-[10px] font-bold text-slate-600">
+                Mover/Girar transforma a planta conectada inteira. Comprimento/ângulo move o nó final compartilhado. OFFSET cria uma parede paralela independente.
+              </span>
+            </div>
+          );
+        })()}
         {activeTool === 'draw_wall' && (
           <div className="bg-[#E4E3E0]/60 p-2.5 border border-[#141414] flex flex-wrap items-center gap-4 text-xs">
             <span className="font-black uppercase flex items-center gap-1">

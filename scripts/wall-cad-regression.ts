@@ -9,6 +9,11 @@ import {
   findClosedWallFaces,
   findWallNodeNearPoint,
   getConnectedWallIds,
+  getWallSelectionBounds,
+  translateWallSelection,
+  rotateWallSelection,
+  offsetWallCenterline,
+  setWallEndByLengthAngle,
 } from '../src/utils/wallCadEngine';
 
 const wall = (
@@ -276,7 +281,60 @@ const nodeAt = (walls: FloorPlanWall[], x: number, y: number, radius = 0.004) =>
   assert.deepEqual(twice, once);
 }
 
-console.log('wall-cad-regression: 20 cenários críticos passaram');
+
+// 21) Translação exata preserva comprimentos e nós internos da rede selecionada.
+{
+  const walls = [wall('a', 0, 0, 2, 0), wall('b', 2, 0, 2, 2)];
+  const moved = translateWallSelection(walls, ['a', 'b'], 1.25, -0.5);
+  assert.ok(Math.hypot(moved[0].x2Meters - moved[1].x1Meters, moved[0].y2Meters - moved[1].y1Meters) < 1e-9);
+  assert.ok(Math.abs(Math.hypot(moved[0].x2Meters - moved[0].x1Meters, moved[0].y2Meters - moved[0].y1Meters) - 2) < 1e-9);
+}
+
+// 22) Rotação de 90° de um retângulo preserva área, perímetro e fechamento.
+{
+  const walls = [
+    wall('top', 0, 0, 4, 0),
+    wall('right', 4, 0, 4, 3),
+    wall('bottom', 4, 3, 0, 3),
+    wall('left', 0, 3, 0, 0),
+  ];
+  const rotated = rotateWallSelection(walls, walls.map((item) => item.id), 90);
+  const loops = findClosedWallPerimeters(rotated);
+  assert.equal(loops.length, 1);
+  assert.ok(Math.abs(loops[0].areaSquareMeters - 12) < 1e-8);
+  assert.ok(Math.abs(loops[0].perimeterMeters - 14) < 1e-8);
+}
+
+// 23) Offset mantém comprimento e paralelismo com distância assinada exata.
+{
+  const source = wall('a', 0, 0, 4, 0);
+  const shifted = offsetWallCenterline(source, 0.20)!;
+  assert.ok(shifted);
+  assert.ok(Math.abs(shifted.y1Meters - 0.20) < 1e-9);
+  assert.ok(Math.abs(shifted.y2Meters - 0.20) < 1e-9);
+  assert.ok(Math.abs((shifted.x2Meters - shifted.x1Meters) - 4) < 1e-9);
+}
+
+// 24) Comprimento/ângulo exatos reposicionam somente P2 de forma determinística.
+{
+  const edited = setWallEndByLengthAngle(wall('a', 1, 1, 5, 1), 2.5, 90);
+  assert.ok(Math.abs(edited.x1Meters - 1) < 1e-9);
+  assert.ok(Math.abs(edited.y1Meters - 1) < 1e-9);
+  assert.ok(Math.abs(edited.x2Meters - 1) < 1e-9);
+  assert.ok(Math.abs(edited.y2Meters + 1.5) < 1e-9);
+}
+
+// 25) Bounds da seleção usam todos os endpoints e centro geométrico da caixa.
+{
+  const walls = [wall('a', -1, 2, 3, 2), wall('b', 3, 2, 3, 6)];
+  const bounds = getWallSelectionBounds(walls, ['a', 'b'])!;
+  assert.deepEqual(bounds.center, { x: 1, y: 4 });
+  assert.equal(bounds.minX, -1);
+  assert.equal(bounds.maxY, 6);
+}
+
+console.log('wall-cad-regression: 25 cenários críticos passaram');
+
 
 
 
