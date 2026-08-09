@@ -650,3 +650,204 @@ export const wallNodeLabel = (node: WallGraphNode): string => {
       return node.branches.length >= 5 ? '*' : 'multi';
   }
 };
+
+
+export interface WallPrecisionOptions {
+  lockedLengthMeters?: number | null;
+  lockedAngleDeg?: number | null;
+  polarIncrementDeg?: number | null;
+}
+
+export interface WallPrecisionResult {
+  point: CadPoint;
+  lengthMeters: number;
+  angleDeg: number;
+  constrainedLength: boolean;
+  constrainedAngle: boolean;
+}
+
+const normalizeAngleDeg = (angleDeg: number) => {
+  const normalized = angleDeg % 360;
+  return normalized < 0 ? normalized + 360 : normalized;
+};
+
+/**
+ * Applies CAD-style hard length/angle constraints. Angles follow the conventional
+ * architectural coordinate system: 0° = right, 90° = up, 180° = left, 270° = down.
+ */
+export const applyWallPrecisionConstraints = (
+  start: CadPoint,
+  rawPoint: CadPoint,
+  options: WallPrecisionOptions = {}
+): WallPrecisionResult => {
+  const dx = rawPoint.x - start.x;
+  const dy = rawPoint.y - start.y;
+  const rawLength = Math.hypot(dx, dy);
+  const rawAngle = normalizeAngleDeg((Math.atan2(-dy, dx) * 180) / Math.PI);
+
+  const hasLockedAngle =
+    Number.isFinite(options.lockedAngleDeg) && options.lockedAngleDeg !== null;
+  const polarIncrement =
+    Number.isFinite(options.polarIncrementDeg) && (options.polarIncrementDeg || 0) > 0
+      ? Math.abs(options.polarIncrementDeg as number)
+      : 0;
+  const angleDeg = hasLockedAngle
+    ? normalizeAngleDeg(options.lockedAngleDeg as number)
+    : polarIncrement > 0
+      ? normalizeAngleDeg(Math.round(rawAngle / polarIncrement) * polarIncrement)
+      : rawAngle;
+
+  const hasLockedLength =
+    Number.isFinite(options.lockedLengthMeters) && (options.lockedLengthMeters || 0) > 0;
+  const lengthMeters = hasLockedLength
+    ? Math.abs(options.lockedLengthMeters as number)
+    : rawLength;
+  const angleRad = (angleDeg * Math.PI) / 180;
+
+  return {
+    point: {
+      x: start.x + Math.cos(angleRad) * lengthMeters,
+      y: start.y - Math.sin(angleRad) * lengthMeters,
+    },
+    lengthMeters,
+    angleDeg,
+    constrainedLength: hasLockedLength,
+    constrainedAngle: hasLockedAngle || polarIncrement > 0,
+  };
+};
+
+export interface ClosedWallPerimeter {
+  id: string;
+  wallIds: string[];
+  points: CadPoint[];
+  areaSquareMeters: number;
+  perimeterMeters: number;
+  centroid: CadPoint;
+}
+
+const polygonAreaAndCentroid = (points: CadPoint[]) => {
+  let twiceArea = 0;
+  let centroidXTimes6Area = 0;
+  let centroidYTimes6Area = 0;
+  for (let i = 0; i < points.length; i += 1) {
+    const current = points[i];
+    const next = points[(i + 1) % points.length];
+    const term = current.x * next.y - next.x * current.y;
+    twiceArea += term;
+    centroidXTimes6Area += (current.x + next.x) * term;
+    centroidYTimes6Area += (current.y + next.y) * term;
+  }
+  const signedArea = twiceArea / 2;
+  if (Math.abs(signedArea) <= CAD_GEOMETRY_EPSILON_M) {
+    return {
+      area: 0,
+      centroid: {
+        x: points.reduce((sum, point) => sum + point.x, 0) / Math.max(1, points.length),
+        y: points.reduce((sum, point) => sum + point.y, 0) / Math.max(1, points.length),
+      },
+    };
+  }
+  return {
+    area: Math.abs(signedArea),
+    centroid: {
+      x: centroidXTimes6Area / (6 * signedArea),
+      y: centroidYTimes6Area / (6 * signedArea),
+    },
+  };
+};
+
+/**
+ * Detects simple closed wall-only components (polygons where every node has degree 2).
+ * It deliberately does not invent room faces inside branched/T networks; those require
+ * a later planar-face solver. The result is therefore deterministic and safe.
+ */
+export const findClosedWallPerimeters = (
+  walls: FloorPlanWall[],
+  options: WallGraphOptions = {}
+): ClosedWallPerimeter[] => {
+  const graph = buildWallGraph(walls, options);
+  const wallById = new Map(walls.map((wall) => [wall.id, wall] as const));
+  const nodeByEndpoint = new Map<string, WallGraphNode>();
+
+  for (const node of graph.nodes) {
+    for (const branch of node.branches) {
+      if (branch.role === 'start' || branch.role === 'end') {
+        nodeByEndpoint.set(`${branch.wallId}:${branch.role}`, node);
+      }
+    }
+  }
+
+  const seenComponents = new Set<string>();
+  const result: ClosedWallPerimeter[] = [];
+
+  graph.componentByWallId.forEach((wallIds) => {
+    const key = wallIds.join('|');
+    if (seenComponents.has(key)) return;
+    seenComponents.add(key);
+    if (wallIds.length < 3) return;
+
+    type Edge = { wallId: string; a: string; b: string };
+    const edges: Edge[] = [];
+    const nodeMap = new Map<string, WallGraphNode>();
+    for (const wallId of wallIds) {
+      const startNode = nodeByEndpoint.get(`${wallId}:start`);
+      const endNode = nodeByEndpoint.get(`${wallId}:end`);
+      if (!startNode || !endNode || startNode.id === endNode.id) return;
+      edges.push({ wallId, a: startNode.id, b: endNode.id });
+      nodeMap.set(startNode.id, startNode);
+      nodeMap.set(endNode.id, endNode);
+    }
+    if (edges.length !== wallIds.length) return;
+
+    const incident = new Map<string, Edge[]>();
+    edges.forEach((edge) => {
+      incident.set(edge.a, [...(incident.get(edge.a) || []), edge]);
+      incident.set(edge.b, [...(incident.get(edge.b) || []), edge]);
+    });
+    if (Array.from(incident.values()).some((items) => items.length !== 2)) return;
+    if (incident.size !== edges.length) return;
+
+    const firstEdge = edges[0];
+    const startNodeId = firstEdge.a;
+    let currentNodeId = startNodeId;
+    let previousWallId: string | null = null;
+    const usedWalls = new Set<string>();
+    const orderedPoints: CadPoint[] = [];
+
+    for (let guard = 0; guard <= edges.length; guard += 1) {
+      const node = nodeMap.get(currentNodeId);
+      if (!node) return;
+      orderedPoints.push({ ...node.point });
+      const choices = incident.get(currentNodeId) || [];
+      const nextEdge = choices.find((edge) => edge.wallId !== previousWallId && !usedWalls.has(edge.wallId));
+      if (!nextEdge) break;
+      usedWalls.add(nextEdge.wallId);
+      previousWallId = nextEdge.wallId;
+      currentNodeId = nextEdge.a === currentNodeId ? nextEdge.b : nextEdge.a;
+      if (currentNodeId === startNodeId) break;
+    }
+
+    if (currentNodeId !== startNodeId || usedWalls.size !== edges.length) return;
+    if (orderedPoints.length < 3) return;
+
+    const { area, centroid } = polygonAreaAndCentroid(orderedPoints);
+    if (area <= CAD_GEOMETRY_EPSILON_M) return;
+    const perimeterMeters = wallIds.reduce((sum, wallId) => {
+      const wall = wallById.get(wallId);
+      return wall
+        ? sum + Math.hypot(wall.x2Meters - wall.x1Meters, wall.y2Meters - wall.y1Meters)
+        : sum;
+    }, 0);
+
+    result.push({
+      id: `perimeter_${wallIds.join('_')}`,
+      wallIds: [...wallIds],
+      points: orderedPoints,
+      areaSquareMeters: area,
+      perimeterMeters,
+      centroid,
+    });
+  });
+
+  return result.sort((a, b) => b.areaSquareMeters - a.areaSquareMeters);
+};
