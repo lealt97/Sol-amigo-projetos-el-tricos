@@ -1,0 +1,48 @@
+name: Agent CAD node editing
+
+on:
+  push:
+    branches:
+      - agent/cad-floorplan-kernel
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-validate:
+    if: ${{ !contains(github.event.head_commit.message, '[node-edit-done]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/cad-floorplan-kernel
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Apply safe node editing patch
+        run: python scripts/refine-cad-node-editing.py
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: TypeScript validation
+        run: npm run lint
+
+      - name: CAD geometry regressions
+        run: npm run test:cad
+
+      - name: Production build
+        run: npm run build
+
+      - name: Commit validated node editing
+        run: |
+          git config user.name "Renan Leal"
+          git config user.email "lealt97@gmail.com"
+          git add src/components/FloorPlanEditor.tsx
+          git commit -m "feat: preservar nós compartilhados ao editar [node-edit-done]"
+          git push origin agent/cad-floorplan-kernel
