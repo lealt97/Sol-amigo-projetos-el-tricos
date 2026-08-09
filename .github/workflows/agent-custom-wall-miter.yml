@@ -1,0 +1,45 @@
+name: Agent custom wall miter
+
+on:
+  push:
+    branches:
+      - agent/custom-wall-miter-corners
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-validate:
+    if: ${{ !contains(github.event.head_commit.message, '[agent-done]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/custom-wall-miter-corners
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Apply miter patch
+        run: python scripts/fix_custom_wall_miter.py
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: TypeScript validation
+        run: npm run lint
+
+      - name: Production build
+        run: npm run build
+
+      - name: Commit validated change
+        run: |
+          git config user.name "Renan Leal"
+          git config user.email "lealt97@gmail.com"
+          git add src/components/FloorPlanEditor.tsx
+          git commit -m "fix: aplicar miter nas juncoes L de paredes [agent-done]"
+          git push origin agent/custom-wall-miter-corners
