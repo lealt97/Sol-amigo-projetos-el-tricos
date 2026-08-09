@@ -46,6 +46,8 @@ import {
 } from '../utils/nbrSheetEngine';
 import {
   analyzeWallNetwork,
+  applyWallPrecisionConstraints,
+  findClosedWallPerimeters,
   findWallNodeNearPoint,
   getConnectedWallIds,
   type WallGraphNode,
@@ -172,6 +174,11 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
     snapInfo?: string;
     snapTargetPoint?: { x: number; y: number };
   } | null>(null);
+  const [wallDrawMode, setWallDrawMode] = useState<'continuous' | 'drag'>('continuous');
+  const [wallLockedLengthInput, setWallLockedLengthInput] = useState('');
+  const [wallLockedAngleInput, setWallLockedAngleInput] = useState('');
+  const [wallPolarIncrementDeg, setWallPolarIncrementDeg] = useState(0);
+  const [showWallOsnapPoints, setShowWallOsnapPoints] = useState(true);
   const [draggingWallHandle, setDraggingWallHandle] = useState<{
     wallId: string;
     handle: 'p1' | 'p2';
@@ -441,6 +448,14 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
   };
 
   const cancelCurrentOperation = () => {
+    if (activeTool === 'draw_wall' && wallDrawMode === 'continuous' && isDrawingWall) {
+      setIsDrawingWall(false);
+      setWallStartPos(null);
+      setWallCurrentPos(null);
+      setWallSnapInfo(null);
+      setToolStatus('Traçado contínuo finalizado. Clique para iniciar outro trecho.');
+      return;
+    }
     rollbackHistoryTransaction();
     resetTransientGesture();
     setConduitFromId(null);
@@ -451,6 +466,10 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
   };
 
   const handleCanvasMouseLeave = () => {
+    if (isDrawingWall && wallDrawMode === 'continuous') {
+      setToolStatus('Traçado contínuo preservado. Volte ao canvas para continuar ou pressione Esc/Enter para finalizar.');
+      return;
+    }
     if (isDrawingRoom || isDrawingWall || isMeasuring) {
       setToolStatus('Gesto cancelado porque o cursor saiu da área de desenho.');
     }
@@ -547,6 +566,10 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
     [floorPlanWalls, wallThicknessMeters]
   );
   const wallGraph = wallCadAnalysis.graph;
+  const closedWallPerimeters = useMemo(
+    () => findClosedWallPerimeters(floorPlanWalls, { defaultThicknessMeters: wallThicknessMeters }),
+    [floorPlanWalls, wallThicknessMeters]
+  );
 
   // A room is stored by its architectural outer rectangle, while the rendered masonry
   // grows inward. Keep axis + both physical faces so a custom wall can make a true
@@ -1111,6 +1134,53 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
     return { x, y, isSnapped, snapInfo, snapTargetPoint };
   };
 
+  const parsePositiveCadNumber = (value: string): number | null => {
+    if (!value.trim()) return null;
+    const parsed = Number(value.replace(',', '.'));
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+  };
+
+  const parseCadAngle = (value: string): number | null => {
+    if (!value.trim()) return null;
+    const parsed = Number(value.replace(',', '.'));
+    return Number.isFinite(parsed) ? parsed : null;
+  };
+
+  const getWallDrawingTarget = (
+    rawCoords: { x: number; y: number },
+    startPos: { x: number; y: number },
+    isShiftPressed = false
+  ) => {
+    const snapped = getSmartWallCoords(rawCoords, startPos, isShiftPressed);
+    const lockedLengthMeters = parsePositiveCadNumber(wallLockedLengthInput);
+    const lockedAngleDeg = parseCadAngle(wallLockedAngleInput);
+    const hasHardConstraint = lockedLengthMeters !== null || lockedAngleDeg !== null;
+    const polarIncrementDeg = !hasHardConstraint && !snapped.snapTargetPoint
+      ? wallPolarIncrementDeg
+      : 0;
+
+    if (!hasHardConstraint && polarIncrementDeg <= 0) return snapped;
+
+    const precision = applyWallPrecisionConstraints(
+      startPos,
+      { x: snapped.x, y: snapped.y },
+      { lockedLengthMeters, lockedAngleDeg, polarIncrementDeg }
+    );
+    const details = [
+      precision.constrainedLength ? `L=${precision.lengthMeters.toFixed(3)}m` : null,
+      precision.constrainedAngle ? `A=${precision.angleDeg.toFixed(1)}°` : null,
+    ].filter(Boolean).join(' • ');
+
+    return {
+      ...snapped,
+      x: precision.point.x,
+      y: precision.point.y,
+      isSnapped: true,
+      snapInfo: details ? `📐 ${details}` : snapped.snapInfo,
+      snapTargetPoint: hasHardConstraint ? undefined : snapped.snapTargetPoint,
+    };
+  };
+
   const getOpeningPlacementOnSegment = (
     point: { x: number; y: number },
     widthMeters: number,
@@ -1431,6 +1501,84 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
     );
   };
 
+  const commitCustomWallSegment = (
+    startPoint: { x: number; y: number },
+    endPoint: { x: number; y: number }
+  ): { created: boolean; endPoint: { x: number; y: number } } => {
+    const draftWall: FloorPlanWall = {
+      id: `wall_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      x1Meters: startPoint.x,
+      y1Meters: startPoint.y,
+      x2Meters: endPoint.x,
+      y2Meters: endPoint.y,
+      thicknessMeters: wallThicknessMeters,
+      label: '',
+    };
+    const normalizedWall = normalizeWallConnections(draftWall);
+    const dx = normalizedWall.x2Meters - normalizedWall.x1Meters;
+    const dy = normalizedWall.y2Meters - normalizedWall.y1Meters;
+    const dist = Math.hypot(dx, dy);
+    const normalizedEnd = { x: normalizedWall.x2Meters, y: normalizedWall.y2Meters };
+
+    if (dist < 0.1) {
+      setToolStatus('Trecho ignorado: comprimento mínimo de parede é 0,10 m.');
+      return { created: false, endPoint: normalizedEnd };
+    }
+
+    const startTopologyBefore = getEndpointNodeTopology({
+      x: normalizedWall.x1Meters,
+      y: normalizedWall.y1Meters,
+    });
+    const endTopologyBefore = getEndpointNodeTopology(normalizedEnd);
+    const inheritedGroupId = [startTopologyBefore, endTopologyBefore]
+      .flatMap((topology) => topology?.branches || [])
+      .map((branch) => branch.wall.groupId)
+      .find((groupId): groupId is string => Boolean(groupId));
+    const sourceTopologyBefore = startTopologyBefore || endTopologyBefore;
+    const sourceNodeLabel = sourceTopologyBefore
+      ? getEndpointNodeDisplayLabel(sourceTopologyBefore)
+      : null;
+    const sourceNodeBranchCount = sourceTopologyBefore?.branches.length || 0;
+
+    const newWall: FloorPlanWall = {
+      ...normalizedWall,
+      groupId: inheritedGroupId || normalizedWall.groupId || `wallgrp_${normalizedWall.id}`,
+      label: `Parede ${floorPlanWalls.length + 1} (${dist.toFixed(2)}m)`,
+    };
+    const nextWalls = [...floorPlanWalls, newWall];
+    const nextCadAnalysis = analyzeWallNetwork(nextWalls, {
+      defaultThicknessMeters: wallThicknessMeters,
+    });
+    const duplicateIssue = nextCadAnalysis.issues.find(
+      (issue) => issue.code === 'DUPLICATE' && issue.wallIds.includes(newWall.id)
+    );
+
+    if (duplicateIssue) {
+      setToolStatus('Parede não criada: já existe uma parede exatamente sobre esse segmento.');
+      return { created: false, endPoint: normalizedEnd };
+    }
+
+    onUpdateProjectData({
+      ...projectData,
+      floorPlan: {
+        scalePixelsPerMeter: scalePxPerMeter,
+        gridSnapMeters,
+        symbols: floorPlanSymbols,
+        conduits: floorPlanConduits,
+        openings: floorPlanOpenings,
+        walls: nextWalls,
+      },
+    });
+    setToolStatus(
+      sourceTopologyBefore
+        ? `Ramificação adicionada ao nó ${sourceNodeLabel}. O encontro agora possui ${sourceNodeBranchCount + 1} paredes no mesmo desenho.`
+        : nextCadAnalysis.issues.length > 0
+          ? `Parede criada. CAD detectou ${nextCadAnalysis.issues.length} ponto(s) para revisão.`
+          : 'Parede criada e rede geométrica íntegra.'
+    );
+    return { created: true, endPoint: normalizedEnd };
+  };
+
   // Canvas Mouse Down
   const handleMouseDown = (e: React.MouseEvent<SVGSVGElement>) => {
     if (e.button === 1 || (e.button === 0 && isSpacePressed)) {
@@ -1457,12 +1605,33 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
       setDragStartPos(coords);
       setDragCurrentPos(coords);
     } else if (activeTool === 'draw_wall') {
-      beginHistoryTransaction();
-      const snap = getSmartWallCoords(coords, null, e.shiftKey);
-      setIsDrawingWall(true);
-      setWallStartPos({ x: snap.x, y: snap.y });
-      setWallCurrentPos({ x: snap.x, y: snap.y });
-      setWallSnapInfo(snap);
+      if (wallDrawMode === 'continuous') {
+        if (!isDrawingWall || !wallStartPos) {
+          const startSnap = getSmartWallCoords(coords, null, e.shiftKey);
+          const startPoint = { x: startSnap.x, y: startSnap.y };
+          setIsDrawingWall(true);
+          setWallStartPos(startPoint);
+          setWallCurrentPos(startPoint);
+          setWallSnapInfo(startSnap);
+          setToolStatus('Traçado contínuo iniciado. Clique nos próximos pontos; Esc ou Enter finaliza.');
+        } else {
+          const target = getWallDrawingTarget(coords, wallStartPos, e.shiftKey);
+          const result = commitCustomWallSegment(wallStartPos, { x: target.x, y: target.y });
+          if (result.created) {
+            setWallStartPos(result.endPoint);
+            setWallCurrentPos(result.endPoint);
+            setWallSnapInfo(target);
+            setToolStatus('Trecho criado. Continue clicando ou pressione Esc/Enter para finalizar.');
+          }
+        }
+      } else {
+        beginHistoryTransaction();
+        const startSnap = getSmartWallCoords(coords, null, e.shiftKey);
+        setIsDrawingWall(true);
+        setWallStartPos({ x: startSnap.x, y: startSnap.y });
+        setWallCurrentPos({ x: startSnap.x, y: startSnap.y });
+        setWallSnapInfo(startSnap);
+      }
     } else if (activeTool === 'add_door') {
       const placement = getOpeningPlacementOnWall(coords, doorWidthMeters);
       if (!placement) {
@@ -1882,9 +2051,9 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
     } else if (isDrawingRoom) {
       setDragCurrentPos(coords);
     } else if (isDrawingWall && wallStartPos) {
-      const snap = getSmartWallCoords(coords, wallStartPos, e.shiftKey);
-      setWallCurrentPos({ x: snap.x, y: snap.y });
-      setWallSnapInfo(snap);
+      const target = getWallDrawingTarget(coords, wallStartPos, e.shiftKey);
+      setWallCurrentPos({ x: target.x, y: target.y });
+      setWallSnapInfo(target);
     } else if (isMeasuring && measureStart) {
       setMeasureEnd(coords);
     }
@@ -1930,78 +2099,12 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
       return;
     }
 
+    if (isDrawingWall && wallDrawMode === 'continuous') {
+      return;
+    }
+
     if (isDrawingWall && wallStartPos && wallCurrentPos) {
-      const draftWall: FloorPlanWall = {
-        id: `wall_${Date.now()}`,
-        x1Meters: wallStartPos.x,
-        y1Meters: wallStartPos.y,
-        x2Meters: wallCurrentPos.x,
-        y2Meters: wallCurrentPos.y,
-        thicknessMeters: wallThicknessMeters,
-        label: '',
-      };
-      const normalizedWall = normalizeWallConnections(draftWall);
-      const dx = normalizedWall.x2Meters - normalizedWall.x1Meters;
-      const dy = normalizedWall.y2Meters - normalizedWall.y1Meters;
-      const dist = Math.hypot(dx, dy);
-
-      if (dist >= 0.1) {
-        const startTopologyBefore = getEndpointNodeTopology({
-          x: normalizedWall.x1Meters,
-          y: normalizedWall.y1Meters,
-        });
-        const endTopologyBefore = getEndpointNodeTopology({
-          x: normalizedWall.x2Meters,
-          y: normalizedWall.y2Meters,
-        });
-        const inheritedGroupId = [startTopologyBefore, endTopologyBefore]
-          .flatMap((topology) => topology?.branches || [])
-          .map((branch) => branch.wall.groupId)
-          .find((groupId): groupId is string => Boolean(groupId));
-        const sourceTopologyBefore = startTopologyBefore || endTopologyBefore;
-        const sourceNodeLabel = sourceTopologyBefore
-          ? getEndpointNodeDisplayLabel(sourceTopologyBefore)
-          : null;
-        const sourceNodeBranchCount = sourceTopologyBefore?.branches.length || 0;
-
-        const newWall: FloorPlanWall = {
-          ...normalizedWall,
-          groupId: inheritedGroupId || normalizedWall.groupId || `wallgrp_${normalizedWall.id}`,
-          label: `Parede ${floorPlanWalls.length + 1} (${dist.toFixed(2)}m)`,
-        };
-
-        const nextWalls = [...floorPlanWalls, newWall];
-        const nextCadAnalysis = analyzeWallNetwork(nextWalls, {
-          defaultThicknessMeters: wallThicknessMeters,
-        });
-        const duplicateIssue = nextCadAnalysis.issues.find(
-          (issue) => issue.code === 'DUPLICATE' && issue.wallIds.includes(newWall.id)
-        );
-
-        if (duplicateIssue) {
-          setToolStatus('Parede não criada: já existe uma parede exatamente sobre esse segmento.');
-        } else {
-          onUpdateProjectData({
-            ...projectData,
-            floorPlan: {
-              scalePixelsPerMeter: scalePxPerMeter,
-              gridSnapMeters,
-              symbols: floorPlanSymbols,
-              conduits: floorPlanConduits,
-              openings: floorPlanOpenings,
-              walls: nextWalls,
-            },
-          });
-          setToolStatus(
-            sourceTopologyBefore
-              ? `Ramificação adicionada ao nó ${sourceNodeLabel}. O encontro agora possui ${sourceNodeBranchCount + 1} paredes no mesmo desenho.`
-              : nextCadAnalysis.issues.length > 0
-                ? `Parede criada. CAD detectou ${nextCadAnalysis.issues.length} ponto(s) para revisão.`
-                : 'Parede criada e rede geométrica íntegra.'
-          );
-        }
-      }
-
+      commitCustomWallSegment(wallStartPos, wallCurrentPos);
       finishHistoryTransaction();
       setIsDrawingWall(false);
       setWallStartPos(null);
@@ -2264,6 +2367,16 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
         return;
       }
 
+      if (e.key === 'Enter' && activeTool === 'draw_wall' && wallDrawMode === 'continuous' && isDrawingWall) {
+        e.preventDefault();
+        setIsDrawingWall(false);
+        setWallStartPos(null);
+        setWallCurrentPos(null);
+        setWallSnapInfo(null);
+        setToolStatus('Traçado contínuo finalizado. Clique para iniciar outro trecho.');
+        return;
+      }
+
       if (!e.ctrlKey && !e.metaKey && !e.altKey) {
         const shortcutMap: Record<string, ToolMode> = {
           v: 'select',
@@ -2321,6 +2434,8 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
     gridSnapMeters,
     zoomViewport,
     fitSheetToViewport,
+    wallDrawMode,
+    isDrawingWall,
   ]);
 
   // Auto-Distribute Mandatory NBR 5410 Electrical Points & Architectural Openings
@@ -3023,24 +3138,40 @@ function distToSegment(
 
   const beginWallFromExactNode = (
     point: { x: number; y: number },
-    e: React.MouseEvent<SVGGElement>
+    e: React.MouseEvent<SVGGElement>,
+    explicitLabel?: string
   ) => {
-    if (activeTool !== 'draw_wall' || isDrawingWall || e.button !== 0) return;
+    if (activeTool !== 'draw_wall' || e.button !== 0) return;
     e.stopPropagation();
     const topology = getEndpointNodeTopology(point);
-    const label = topology ? getEndpointNodeDisplayLabel(topology) : 'compartilhado';
+    const label = explicitLabel || (topology ? getEndpointNodeDisplayLabel(topology) : 'OSNAP');
     const nextCount = (topology?.branches.length || 0) + 1;
-    beginHistoryTransaction();
+
+    if (wallDrawMode === 'continuous' && isDrawingWall && wallStartPos) {
+      const result = commitCustomWallSegment(wallStartPos, point);
+      if (result.created) {
+        setWallStartPos(result.endPoint);
+        setWallCurrentPos(result.endPoint);
+        setWallSnapInfo({ isSnapped: true, snapInfo: `⚡ ${label}`, snapTargetPoint: result.endPoint });
+        setToolStatus(`Trecho criado por OSNAP ${label}. Clique no próximo ponto ou Esc/Enter para finalizar.`);
+      }
+      return;
+    }
+
+    if (isDrawingWall) return;
+    if (wallDrawMode === 'drag') beginHistoryTransaction();
     setIsDrawingWall(true);
     setWallStartPos({ ...point });
     setWallCurrentPos({ ...point });
     setWallSnapInfo({
       isSnapped: true,
-      snapInfo: `⚡ Nó ${label} — nova ramificação`,
+      snapInfo: `⚡ ${label} — ponto exato`,
       snapTargetPoint: { ...point },
     });
     setToolStatus(
-      `Nó ${label} selecionado. Puxe a nova parede; o encontro será recalculado como um único nó com ${nextCount} ramificações.`
+      wallDrawMode === 'continuous'
+        ? `OSNAP ${label} selecionado. Clique no próximo ponto para criar o trecho.`
+        : `OSNAP ${label} selecionado. Arraste para criar a parede${topology ? ` com ${nextCount} ramificações no nó` : ''}.`
     );
   };
 
@@ -3506,6 +3637,69 @@ function distToSegment(
                 <option value={0.20}>20 cm (Externa / Estrutural)</option>
               </select>
             </div>
+            <div className="flex items-center gap-1">
+              <label className="font-bold">Modo:</label>
+              <select
+                value={wallDrawMode}
+                onChange={(e) => {
+                  setWallDrawMode(e.target.value as 'continuous' | 'drag');
+                  setIsDrawingWall(false);
+                  setWallStartPos(null);
+                  setWallCurrentPos(null);
+                  setWallSnapInfo(null);
+                }}
+                className="bg-white border border-[#141414] px-2 py-1 font-bold cursor-pointer"
+              >
+                <option value="continuous">Contínuo (clique-clique)</option>
+                <option value="drag">Arrastar (legado)</option>
+              </select>
+            </div>
+            <div className="flex items-center gap-1">
+              <label className="font-bold">Comprimento:</label>
+              <input
+                value={wallLockedLengthInput}
+                onChange={(e) => setWallLockedLengthInput(e.target.value)}
+                inputMode="decimal"
+                placeholder="livre"
+                className="w-20 bg-white border border-[#141414] px-2 py-1 font-bold"
+                title="Comprimento exato em metros. Deixe vazio para livre."
+              />
+              <span>m</span>
+            </div>
+            <div className="flex items-center gap-1">
+              <label className="font-bold">Ângulo:</label>
+              <input
+                value={wallLockedAngleInput}
+                onChange={(e) => setWallLockedAngleInput(e.target.value)}
+                inputMode="decimal"
+                placeholder="livre"
+                className="w-20 bg-white border border-[#141414] px-2 py-1 font-bold"
+                title="0° direita, 90° cima, 180° esquerda, 270° baixo."
+              />
+              <span>°</span>
+            </div>
+            <div className="flex items-center gap-1">
+              <label className="font-bold">Polar:</label>
+              <select
+                value={wallPolarIncrementDeg}
+                onChange={(e) => setWallPolarIncrementDeg(Number(e.target.value))}
+                className="bg-white border border-[#141414] px-2 py-1 font-bold cursor-pointer"
+              >
+                <option value={0}>Livre</option>
+                <option value={15}>15°</option>
+                <option value={30}>30°</option>
+                <option value={45}>45°</option>
+                <option value={90}>Orto 90°</option>
+              </select>
+            </div>
+            <label className="flex items-center gap-1 font-bold cursor-pointer">
+              <input
+                type="checkbox"
+                checked={showWallOsnapPoints}
+                onChange={(e) => setShowWallOsnapPoints(e.target.checked)}
+              />
+              OSNAP visível
+            </label>
             <div
               className={`border px-2 py-1 font-black ${
                 wallCadAnalysis.issues.length === 0
@@ -3519,11 +3713,14 @@ function distToSegment(
               }
             >
               CAD: {wallGraph.nodes.filter((node) => node.wallIds.length >= 2).length} nós •{' '}
-              {wallCadAnalysis.componentCount} rede(s) •{' '}
+              {wallCadAnalysis.componentCount} rede(s) • {closedWallPerimeters.length} perímetro(s) fechado(s) •{' '}
+              {closedWallPerimeters.length > 0
+                ? `${closedWallPerimeters.reduce((sum, perimeter) => sum + perimeter.areaSquareMeters, 0).toFixed(2)} m² • `
+                : ''}
               {wallCadAnalysis.issues.length === 0 ? 'íntegro' : `${wallCadAnalysis.issues.length} alerta(s)`}
             </div>
             <span className="text-[11px] font-bold text-blue-900">
-              * Clique em qualquer canto do cômodo ou ponto no canvas e arraste para desenhar uma parede com linhas duplas e hachura!
+              * Contínuo: clique ponto a ponto; Esc/Enter finaliza. Use os grips OSNAP para nó/interseção/meio exatos. Comprimento e ângulo preenchidos são restrições rígidas.
             </span>
           </div>
         )}
@@ -4458,7 +4655,7 @@ function distToSegment(
               {/* Every shared endpoint node is extensible. Explicit grips let L, T, +, *,
                   Y and angled nodes receive another branch without weakening the strict
                   endpoint-vs-face snap rule used by normal canvas clicks. */}
-              {activeTool === 'draw_wall' && !isDrawingWall &&
+              {showWallOsnapPoints && activeTool === 'draw_wall' &&
                 getUniqueCustomEndpointNodeTopologies()
                   .map((topology, index) => {
                     const cx = topology.point.x * scalePxPerMeter;
@@ -4488,6 +4685,28 @@ function distToSegment(
                       </g>
                     );
                   })}
+
+              {/* Explicit midpoint OSNAP. Clicking the diamond bypasses grid rounding and creates an exact T anchor. */}
+              {showWallOsnapPoints && activeTool === 'draw_wall' && floorPlanWalls.map((wall) => {
+                const mx = ((wall.x1Meters + wall.x2Meters) / 2) * scalePxPerMeter;
+                const my = ((wall.y1Meters + wall.y2Meters) / 2) * scalePxPerMeter;
+                const point = {
+                  x: (wall.x1Meters + wall.x2Meters) / 2,
+                  y: (wall.y1Meters + wall.y2Meters) / 2,
+                };
+                return (
+                  <g
+                    key={`wall-mid-osnap-${wall.id}`}
+                    transform={`translate(${mx}, ${my})`}
+                    onMouseDown={(e) => beginWallFromExactNode(point, e, 'MEIO')}
+                    className="cursor-crosshair"
+                  >
+                    <circle r="10" fill="transparent" />
+                    <path d="M 0 -5 L 5 0 L 0 5 L -5 0 Z" fill="#0891b2" stroke="white" strokeWidth="1.5" />
+                    <title>OSNAP MEIO — ponto médio exato da parede</title>
+                  </g>
+                );
+              })}
 
               {/* CAD geometry diagnostics. These markers are editor-only and never alter model dimensions. */}
               {activeTool === 'draw_wall' && wallCadAnalysis.issues.map((issue, index) => {
@@ -4651,7 +4870,8 @@ function distToSegment(
                 const lengthPx = Math.hypot(dx, dy);
                 if (lengthPx < 1) return null;
 
-                const lengthMeters = (lengthPx / scalePxPerMeter).toFixed(2);
+                const lengthMeters = (lengthPx / scalePxPerMeter).toFixed(3);
+                const angleDeg = ((Math.atan2(-(y2 - y1), x2 - x1) * 180) / Math.PI + 360) % 360;
 
                 const ux = dx / lengthPx;
                 const uy = dy / lengthPx;
@@ -4682,7 +4902,7 @@ function distToSegment(
                       fontWeight="black"
                       textAnchor="middle"
                     >
-                      Parede: {lengthMeters} m
+                      Parede: {lengthMeters} m • {angleDeg.toFixed(1)}°
                     </text>
                   </g>
                 );
@@ -4821,6 +5041,23 @@ function distToSegment(
                   </g>
                 );
               })()}
+
+              {/* Closed wall-only perimeters detected by the CAD graph. */}
+              {showDimensions && closedWallPerimeters.map((perimeter) => {
+                const cx = perimeter.centroid.x * scalePxPerMeter;
+                const cy = perimeter.centroid.y * scalePxPerMeter;
+                return (
+                  <g key={perimeter.id} transform={`translate(${cx}, ${cy})`} pointerEvents="none">
+                    <rect x="-62" y="-13" width="124" height="26" fill="white" fillOpacity="0.9" stroke="#0f766e" strokeWidth="1" />
+                    <text x="0" y="-1" textAnchor="middle" fill="#115e59" fontSize="9" fontWeight="black">
+                      PERÍMETRO FECHADO
+                    </text>
+                    <text x="0" y="9" textAnchor="middle" fill="#115e59" fontSize="9" fontWeight="bold">
+                      {perimeter.areaSquareMeters.toFixed(2)} m² • P {perimeter.perimeterMeters.toFixed(2)} m
+                    </text>
+                  </g>
+                );
+              })}
 
               {/* 3. Architectural Openings (Portas e Janelas) */}
               {showOpenings && floorPlanOpenings.map((op) => renderArchitecturalOpening(op))}

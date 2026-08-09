@@ -2,7 +2,9 @@ import assert from 'node:assert/strict';
 import type { FloorPlanWall } from '../src/types';
 import {
   analyzeWallNetwork,
+  applyWallPrecisionConstraints,
   buildWallGraph,
+  findClosedWallPerimeters,
   findWallNodeNearPoint,
   getConnectedWallIds,
 } from '../src/utils/wallCadEngine';
@@ -134,4 +136,50 @@ const nodeAt = (walls: FloorPlanWall[], x: number, y: number, radius = 0.004) =>
   assert.ok(analysis.issues.some((issue) => issue.code === 'NEAR_MISS'));
 }
 
-console.log('wall-cad-regression: 9 cenários críticos passaram');
+
+// 10) Comprimento e ângulo exatos são hard constraints, independentes do grid.
+{
+  const precise = applyWallPrecisionConstraints(
+    { x: 1, y: 1 },
+    { x: 9, y: 7 },
+    { lockedLengthMeters: 2, lockedAngleDeg: 0 }
+  );
+  assert.ok(Math.abs(precise.point.x - 3) < 1e-9);
+  assert.ok(Math.abs(precise.point.y - 1) < 1e-9);
+  assert.equal(precise.lengthMeters, 2);
+  assert.equal(precise.angleDeg, 0);
+}
+
+// 11) Rastreamento polar quantiza o ângulo sem alterar o comprimento livre.
+{
+  const precise = applyWallPrecisionConstraints(
+    { x: 0, y: 0 },
+    { x: 2, y: -1.8 },
+    { polarIncrementDeg: 45 }
+  );
+  assert.equal(precise.angleDeg, 45);
+  assert.ok(Math.abs(precise.lengthMeters - Math.hypot(2, 1.8)) < 1e-9);
+}
+
+// 12) Perímetro simples fechado calcula área e perímetro reais.
+{
+  const walls = [
+    wall('top', 0, 0, 4, 0),
+    wall('right', 4, 0, 4, 3),
+    wall('bottom', 4, 3, 0, 3),
+    wall('left', 0, 3, 0, 0),
+  ];
+  const loops = findClosedWallPerimeters(walls);
+  assert.equal(loops.length, 1);
+  assert.ok(Math.abs(loops[0].areaSquareMeters - 12) < 1e-9);
+  assert.ok(Math.abs(loops[0].perimeterMeters - 14) < 1e-9);
+}
+
+// 13) Rede aberta nunca é anunciada como perímetro fechado.
+{
+  const walls = [wall('a', 0, 0, 3, 0), wall('b', 3, 0, 3, 2)];
+  assert.equal(findClosedWallPerimeters(walls).length, 0);
+}
+
+console.log('wall-cad-regression: 13 cenários críticos passaram');
+
