@@ -1,0 +1,48 @@
+name: Agent CAD trim extend assembly
+
+on:
+  push:
+    branches:
+      - agent/cad-trim-extend-assembly
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-validate:
+    if: ${{ !contains(github.event.head_commit.message, '[agent-done]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/cad-trim-extend-assembly
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Apply trim extend and assembly patch
+        run: python scripts/add-trim-extend-assembly.py
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: TypeScript validation
+        run: npm run lint
+
+      - name: CAD geometry regressions
+        run: npm run test:cad
+
+      - name: Production build
+        run: npm run build
+
+      - name: Commit validated implementation
+        run: |
+          git config user.name "Renan Leal"
+          git config user.email "lealt97@gmail.com"
+          git add src/utils/wallCadEngine.ts scripts/wall-cad-regression.ts src/components/FloorPlanEditor.tsx
+          git commit -m "feat: adicionar trim extend e montagem espacial [agent-done]"
+          git push origin agent/cad-trim-extend-assembly
