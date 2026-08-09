@@ -172,7 +172,11 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
     snapInfo?: string;
     snapTargetPoint?: { x: number; y: number };
   } | null>(null);
-  const [draggingWallHandle, setDraggingWallHandle] = useState<{ wallId: string; handle: 'p1' | 'p2' } | null>(null);
+  const [draggingWallHandle, setDraggingWallHandle] = useState<{
+    wallId: string;
+    handle: 'p1' | 'p2';
+    linkedEndpoints?: { wallId: string; handle: 'p1' | 'p2' }[];
+  } | null>(null);
 
   // Architectural Opening Tool State (Portas e Janelas)
   const [doorWidthMeters, setDoorWidthMeters] = useState<number>(0.8); // 80cm standard door
@@ -1788,15 +1792,31 @@ export const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
           draggingWallHandle.handle === 'p1'
             ? { x: wall.x2Meters, y: wall.y2Meters }
             : { x: wall.x1Meters, y: wall.y1Meters };
-        const snap = getSmartWallCoords(coords, pivotPos, e.shiftKey, draggingWallHandle.wallId);
+        const linkedEndpoints = draggingWallHandle.linkedEndpoints || [
+          { wallId: draggingWallHandle.wallId, handle: draggingWallHandle.handle },
+        ];
+        let nextPoint = coords;
+        if (linkedEndpoints.length <= 1) {
+          const snap = getSmartWallCoords(coords, pivotPos, e.shiftKey, draggingWallHandle.wallId);
+          nextPoint = { x: snap.x, y: snap.y };
+        } else if (e.shiftKey) {
+          const dx = coords.x - pivotPos.x;
+          const dy = coords.y - pivotPos.y;
+          nextPoint = Math.abs(dx) >= Math.abs(dy)
+            ? { x: coords.x, y: pivotPos.y }
+            : { x: pivotPos.x, y: coords.y };
+        }
 
+        const linkedByWall = new Map<string, 'p1' | 'p2'>(
+          linkedEndpoints.map((item) => [item.wallId, item.handle] as const)
+        );
         const updatedWalls = floorPlanWalls.map((w) => {
-          if (w.id !== draggingWallHandle.wallId) return w;
-          if (draggingWallHandle.handle === 'p1') {
-            return { ...w, x1Meters: snap.x, y1Meters: snap.y };
-          } else {
-            return { ...w, x2Meters: snap.x, y2Meters: snap.y };
+          const linkedHandle = linkedByWall.get(w.id);
+          if (!linkedHandle) return w;
+          if (linkedHandle === 'p1') {
+            return { ...w, x1Meters: nextPoint.x, y1Meters: nextPoint.y };
           }
+          return { ...w, x2Meters: nextPoint.x, y2Meters: nextPoint.y };
         });
 
         onUpdateProjectData({
@@ -2899,9 +2919,36 @@ function distToSegment(
 
   const getUniqueCustomEndpointNodeTopologies = (): EndpointNodeTopology[] =>
     wallGraph.nodes
-      .filter((node) => node.wallIds.length >= 2)
       .map(adaptCadNodeToEndpointTopology)
       .filter((topology): topology is EndpointNodeTopology => Boolean(topology));
+
+  const getLinkedEndpointHandles = (
+    wallId: string,
+    handle: 'p1' | 'p2'
+  ): { wallId: string; handle: 'p1' | 'p2' }[] => {
+    const wall = floorPlanWalls.find((item) => item.id === wallId);
+    if (!wall) return [{ wallId, handle }];
+    const point = handle === 'p1'
+      ? { x: wall.x1Meters, y: wall.y1Meters }
+      : { x: wall.x2Meters, y: wall.y2Meters };
+    const cadNode = wallGraph.nodes.find((node) =>
+      Math.hypot(node.point.x - point.x, node.point.y - point.y) <= 0.004 ||
+      node.branches.some((branch) =>
+        branch.wallId === wallId &&
+        Math.hypot(branch.anchor.x - point.x, branch.anchor.y - point.y) <= 0.004
+      )
+    );
+    if (!cadNode) return [{ wallId, handle }];
+
+    const linked: { wallId: string; handle: 'p1' | 'p2' }[] = cadNode.branches.flatMap((branch) => {
+      if (branch.role === 'start') return [{ wallId: branch.wallId, handle: 'p1' as const }];
+      if (branch.role === 'end') return [{ wallId: branch.wallId, handle: 'p2' as const }];
+      return [];
+    });
+    const unique = new Map<string, { wallId: string; handle: 'p1' | 'p2' }>();
+    linked.forEach((item) => unique.set(`${item.wallId}:${item.handle}`, item));
+    return unique.size > 0 ? Array.from(unique.values()) : [{ wallId, handle }];
+  };
 
   // Multi-branch nodes are solved as one topology, not as several independent L corners.
   // At a T, the straight pair is the host and the third branch terminates exactly on the
@@ -4419,11 +4466,13 @@ function distToSegment(
                     const nodeLabel = getEndpointNodeDisplayLabel(topology);
                     const gripColor = topology.kind === 'X'
                       ? '#7c3aed'
-                      : topology.kind === 'multi'
+                      : topology.kind === 'multi' || topology.kind === 'Y'
                         ? '#d97706'
                         : topology.kind === 'T'
                           ? '#0284c7'
-                          : '#16a34a';
+                          : topology.kind === 'single'
+                            ? '#64748b'
+                            : '#16a34a';
                     return (
                       <g
                         key={`node-pull-grip-${index}`}
@@ -4549,7 +4598,11 @@ function distToSegment(
                           onMouseDown={(e) => {
                             e.stopPropagation();
                             beginHistoryTransaction();
-                            setDraggingWallHandle({ wallId: w.id, handle: 'p1' });
+                            const linkedEndpoints = getLinkedEndpointHandles(w.id, 'p1');
+                            setDraggingWallHandle({ wallId: w.id, handle: 'p1', linkedEndpoints });
+                            if (linkedEndpoints.length > 1) {
+                              setToolStatus(`Editando nó compartilhado: ${linkedEndpoints.length} extremidades permanecem conectadas.`);
+                            }
                           }}
                         />
                         <circle
@@ -4563,7 +4616,11 @@ function distToSegment(
                           onMouseDown={(e) => {
                             e.stopPropagation();
                             beginHistoryTransaction();
-                            setDraggingWallHandle({ wallId: w.id, handle: 'p2' });
+                            const linkedEndpoints = getLinkedEndpointHandles(w.id, 'p2');
+                            setDraggingWallHandle({ wallId: w.id, handle: 'p2', linkedEndpoints });
+                            if (linkedEndpoints.length > 1) {
+                              setToolStatus(`Editando nó compartilhado: ${linkedEndpoints.length} extremidades permanecem conectadas.`);
+                            }
                           }}
                         />
                       </g>
