@@ -14,6 +14,9 @@ import {
   rotateWallSelection,
   offsetWallCenterline,
   setWallEndByLengthAngle,
+  isPointInsidePolygon,
+  trimWallEndpointToNearestNode,
+  extendWallEndpointToNearestWall,
 } from '../src/utils/wallCadEngine';
 
 const wall = (
@@ -333,7 +336,64 @@ const nodeAt = (walls: FloorPlanWall[], x: number, y: number, radius = 0.004) =>
   assert.equal(bounds.maxY, 6);
 }
 
-console.log('wall-cad-regression: 25 cenários críticos passaram');
+
+// 26) Point-in-polygon inclui interior e borda, rejeita exterior.
+{
+  const polygon = [{ x: 0, y: 0 }, { x: 4, y: 0 }, { x: 4, y: 3 }, { x: 0, y: 3 }];
+  assert.equal(isPointInsidePolygon({ x: 2, y: 1 }, polygon), true);
+  assert.equal(isPointInsidePolygon({ x: 4, y: 1 }, polygon), true);
+  assert.equal(isPointInsidePolygon({ x: 5, y: 1 }, polygon), false);
+}
+
+// 27) TRIM P1 escolhe o primeiro nó interno na direção da parede.
+{
+  const walls = [
+    wall('host', 0, 0, 6, 0),
+    wall('cross1', 2, -1, 2, 1),
+    wall('cross2', 4, -1, 4, 1),
+  ];
+  const graph = buildWallGraph(walls);
+  const trimmed = trimWallEndpointToNearestNode(walls[0], 'p1', graph)!;
+  assert.ok(trimmed);
+  assert.ok(Math.abs(trimmed.wall.x1Meters - 2) < 1e-9);
+  assert.ok(Math.abs(trimmed.wall.x2Meters - 6) < 1e-9);
+}
+
+// 28) TRIM P2 escolhe o primeiro nó interno vindo da extremidade oposta.
+{
+  const walls = [
+    wall('host', 0, 0, 6, 0),
+    wall('cross1', 2, -1, 2, 1),
+    wall('cross2', 4, -1, 4, 1),
+  ];
+  const graph = buildWallGraph(walls);
+  const trimmed = trimWallEndpointToNearestNode(walls[0], 'p2', graph)!;
+  assert.ok(trimmed);
+  assert.ok(Math.abs(trimmed.wall.x2Meters - 4) < 1e-9);
+}
+
+// 29) EXTEND alcança a parede perpendicular mais próxima à frente do endpoint.
+{
+  const source = wall('source', 0, 0, 2, 0);
+  const targets = [source, wall('far', 5, -2, 5, 2), wall('near', 4, -2, 4, 2)];
+  const extended = extendWallEndpointToNearestWall(source, 'p2', targets)!;
+  assert.ok(extended);
+  assert.equal(extended.targetWallId, 'near');
+  assert.ok(Math.abs(extended.wall.x2Meters - 4) < 1e-9);
+}
+
+// 30) EXTEND ignora alvos atrás da direção escolhida e aceita continuidade colinear à frente.
+{
+  const source = wall('source', 0, 0, 2, 0);
+  const targets = [source, wall('behind', -3, -1, -3, 1), wall('ahead', 4, 0, 6, 0)];
+  const extended = extendWallEndpointToNearestWall(source, 'p2', targets)!;
+  assert.ok(extended);
+  assert.equal(extended.targetWallId, 'ahead');
+  assert.ok(Math.abs(extended.wall.x2Meters - 4) < 1e-9);
+}
+
+console.log('wall-cad-regression: 30 cenários críticos passaram');
+
 
 
 
