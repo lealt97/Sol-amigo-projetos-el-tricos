@@ -35,5 +35,8 @@ jobs:
       - name: TypeScript validation
         run: npm run lint
 
+      - name: CAD geometry regressions
+        run: npm run test:cad
+
       - name: Production build
         run: npm run build
